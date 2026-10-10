@@ -127,6 +127,10 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-recent-tokens N    always-kept newest suffix in select budget (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
+            "  --kvmem-action-lrfu        ActKV action-oriented LRFU retention (default off)\n"
+            "  --kvmem-lrfu-lambda F      LRFU decay lambda, 0 < F < 1 (default 0.50)\n"
+            "  --kvmem-lrfu-top-frac F    hit fraction kept per round, 0 < F <= 1 (default 0.90)\n"
+            "  --kvmem-score-agg NAME     GQA query aggregation: mean | max (default mean)\n"
             "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n"
             "  --kvmem-query-max-tokens N cap last-user retrieval query to this many tokens\n"
             "                            from the end of the span (default 512; qw3-style)\n"
@@ -967,6 +971,14 @@ int main(int argc, char ** argv) {
         } else if (eq(arg, "--kvmem-method")) {
             const char * m = need(arg);
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
+        } else if (eq(arg, "--kvmem-action-lrfu")) {
+            st.kparams.action_lrfu = true;
+        } else if (eq(arg, "--kvmem-lrfu-lambda")) {
+            st.kparams.lrfu_lambda = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--kvmem-lrfu-top-frac")) {
+            st.kparams.lrfu_top_frac = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--kvmem-score-agg")) {
+            st.kparams.score_agg = eq(need(arg), "max") ? 1 : 0;
         } else if (eq(arg, "--kvmem-query-last")) {
             st.query_last_fallback = kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--kvmem-query-replay")) {

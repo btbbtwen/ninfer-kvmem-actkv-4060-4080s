@@ -36,6 +36,13 @@ struct llama_kvmem_params {
     bool     raw_k_nvme;           // put raw-K/V authority on NVMe (qw3-style)
     bool     harvest_v;            // prefill D2H V with K (default off; not implied by raw_k_nvme)
     int32_t  mtp_state;            // 0 snapshots, 1 auto, 2 replay
+    // ActKV (arXiv:2609.31395): action-oriented LRFU eviction and GQA score
+    // aggregation. Field names match the llama ActKV parameters so the same
+    // --kvmem-* flags mean the same thing on every backend.
+    bool     action_lrfu;          // --kvmem-action-lrfu
+    float    lrfu_lambda;          // --kvmem-lrfu-lambda; <= 0 → 0.50 (paper)
+    float    lrfu_top_frac;        // --kvmem-lrfu-top-frac; <= 0 → 0.90 (paper)
+    int32_t  score_agg;            // --kvmem-score-agg: 0 mean (default), 1 max
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults

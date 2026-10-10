@@ -17,6 +17,7 @@ add_library(kvmem
     src/host/kv_content.cpp
     src/host/native_kv_payload.cpp
     src/host/session_memory.cpp
+    src/host/confidence_monitor.cpp
     src/host/rope.cpp
 )
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)

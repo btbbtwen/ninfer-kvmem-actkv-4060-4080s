@@ -479,6 +479,17 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
     cfg.store.select_method = kvmem_current_execution().params.method == 1
         ? kvmem::KvMemMethod::Retrieval
         : kvmem::KvMemMethod::Recency;
+    // ActKV action-oriented eviction (arXiv:2609.31395, Sec. 5.2). lambda and
+    // top-p default to the paper's tuned values (0.50 / 90%), NOT to 0: lambda 0
+    // would collapse the retention into pure recency and top_frac 0 would pin
+    // the hit threshold at the single worst block.
+    cfg.store.action_lrfu = kvmem_current_execution().params.action_lrfu;
+    cfg.store.lrfu_lambda = kvmem_current_execution().params.lrfu_lambda > 0.0f
+        ? kvmem_current_execution().params.lrfu_lambda
+        : kvmem::KvMemStoreConfig{}.lrfu_lambda;
+    cfg.store.lrfu_top_frac = kvmem_current_execution().params.lrfu_top_frac > 0.0f
+        ? kvmem_current_execution().params.lrfu_top_frac
+        : kvmem::KvMemStoreConfig{}.lrfu_top_frac;
     cfg.store.sink_blocks = sink_tokens == 0
         ? 1u
         : std::max(1u, sink_tokens / block_tokens);
@@ -945,6 +956,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     type_v_ = params.type_v;
     v_trans_ = !cparams.flash_attn;
     method_ = kvmem_current_execution().params.method;
+    score_agg_ = kvmem_current_execution().params.score_agg == 1 ? 1 : 0;
     query_begin_ = kvmem_current_execution().params.query_begin;
     query_end_ = kvmem_current_execution().params.query_end;
     force_pos_ = kvmem_current_execution().params.force_pos;
@@ -4229,6 +4241,56 @@ void llama_memory_kvmem::score_retrieval() {
     std::vector<double> scores(nblk, 0.0);
     std::vector<float> mk(n_embd_k_, 0.0f);
     const uint32_t g = n_head_kv_ == 0 ? 1 : n_head_ / n_head_kv_;
+
+    // Fold q_sum_ down to one normalized probe vector per (layer, kv head)
+    // before the block loop. GQA repeats every query head group for every block,
+    // and the old inner loop heap-allocated a qh vector per block x layer x head
+    // -- 320k allocations for a 2500-block pool with 16 layers and 8 kv heads.
+    // The arithmetic is unchanged: invq is folded into qh here, and it cancels
+    // out of dot / (|q| |k|).
+    std::vector<std::vector<float>> qn(n_layer_);
+    std::vector<uint8_t> qn_ok(n_layer_, 0);
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (il >= q_sum_.size() || q_count_[il] == 0 ||
+            q_sum_[il].size() < static_cast<size_t>(n_head_) * n_embd_head_) {
+            continue;
+        }
+        qn[il].assign(static_cast<size_t>(n_head_kv_) * n_embd_head_, 0.0f);
+        const float invq = 1.0f / static_cast<float>(q_count_[il] * std::max(1u, g));
+        for (uint32_t h = 0; h < n_head_kv_; ++h) {
+            float * qh = qn[il].data() + static_cast<size_t>(h) * n_embd_head_;
+            uint32_t seen = 0;
+            for (uint32_t gi = 0; gi < g; ++gi) {
+                const uint32_t qh_i = h * g + gi;
+                if (qh_i >= n_head_) {
+                    break;
+                }
+                ++seen;
+                const float * q = q_sum_[il].data() + static_cast<size_t>(qh_i) * n_embd_head_;
+                for (uint32_t d = 0; d < n_embd_head_; ++d) {
+                    qh[d] += q[d] * invq;
+                }
+            }
+            // GQA groups are not always a whole multiple of n_head_kv_: when the
+            // last group is short, dividing by g under-weights it. Rescale by the
+            // number of heads actually summed so every kv head contributes a
+            // comparable-magnitude probe.
+            if (seen != 0 && seen != g) {
+                const float fix = static_cast<float>(g) / static_cast<float>(seen);
+                for (uint32_t d = 0; d < n_embd_head_; ++d) qh[d] *= fix;
+            }
+        }
+        qn_ok[il] = 1;
+    }
+
+    // ActKV Sec. 7.1 Alg. 3 step 8: aggregate over the query heads of a GQA group
+    // with MAX, not with the folded mean. The mean cancels out a head that
+    // matches strongly against heads that do not; taking the max keeps the
+    // best-matching head's score, which is what identifies an action-critical
+    // entry. It costs g times more dot products, so it stays opt-in
+    // (--kvmem-score-agg max); the default remains the cheap folded mean.
+    const bool agg_max = score_agg_ == 1 && n_head_kv_ > 0;
+
     for (uint32_t b = 0; b < nblk; ++b) {
         if (!raw_->has_block(b)) {
             continue;
@@ -4236,40 +4298,63 @@ void llama_memory_kvmem::score_retrieval() {
         double acc = 0;
         uint32_t nlay = 0;
         for (uint32_t il = 0; il < n_layer_; ++il) {
-            if (q_count_[il] == 0) {
+            if (!qn_ok[il]) {
                 continue;
             }
             raw_->mean_k(b, il, mk.data());
             double layer = 0;
-            const float invq = 1.0f / static_cast<float>(q_count_[il] * std::max(1u, g));
+            const float * qn_l = qn[il].data();
             for (uint32_t h = 0; h < n_head_kv_; ++h) {
-                std::vector<float> qh(n_embd_head_, 0.0f);
-                for (uint32_t gi = 0; gi < g; ++gi) {
-                    const uint32_t qh_i = h * g + gi;
-                    if (qh_i >= n_head_) {
-                        break;
+                const float * kh = mk.data() + static_cast<size_t>(h) * n_embd_head_;
+                if (agg_max) {
+                    // max over the query heads of this GQA group
+                    float best = -1.0e30f;
+                    for (uint32_t gi = 0; gi < g; ++gi) {
+                        const uint32_t qh_i = h * g + gi;
+                        if (qh_i >= n_head_) {
+                            break;
+                        }
+                        const float * q = q_sum_[il].data() + static_cast<size_t>(qh_i) * n_embd_head_;
+                        float dot = 0, nq = 0, nk = 0;
+                        for (uint32_t d = 0; d < n_embd_head_; ++d) {
+                            dot += q[d] * kh[d];
+                            nq += q[d] * q[d];
+                            nk += kh[d] * kh[d];
+                        }
+                        const float c = dot / (std::sqrt(nq) * std::sqrt(nk) + 1e-6f);
+                        if (c > best) best = c;
                     }
-                    const float * q = q_sum_[il].data() + qh_i * n_embd_head_;
+                    layer += static_cast<double>(best);
+                } else {
+                    const float * qh = qn_l + static_cast<size_t>(h) * n_embd_head_;
+                    float dot = 0, nq = 0, nk = 0;
                     for (uint32_t d = 0; d < n_embd_head_; ++d) {
-                        qh[d] += q[d];
+                        dot += qh[d] * kh[d];
+                        nq += qh[d] * qh[d];
+                        nk += kh[d] * kh[d];
                     }
+                    layer += dot / (std::sqrt(nq) * std::sqrt(nk) + 1e-6f);
                 }
-                const float * kh = mk.data() + h * n_embd_head_;
-                float dot = 0, nq = 0, nk = 0;
-                for (uint32_t d = 0; d < n_embd_head_; ++d) {
-                    const float qv = qh[d] * invq;
-                    dot += qv * kh[d];
-                    nq += qv * qv;
-                    nk += kh[d] * kh[d];
-                }
-                layer += dot / (std::sqrt(nq) * std::sqrt(nk) + 1e-6f);
             }
             acc += layer / static_cast<double>(std::max(1u, n_head_kv_));
             nlay++;
         }
         scores[b] = nlay ? acc / nlay : 0;
     }
-    store.set_retrieval_scores(scores);
+    // ActKV Module 2: in Action mode the store folds this one-shot score into
+    // the per-block temporal LRFU retention (Alg. 1) and re-points the selection
+    // score onto that retention, so pick_topk ranks by how often the block has
+    // been the model's action-region target across rounds, not by one-shot
+    // attention. lrfu_round_id() makes repeated scoring inside one ORA round
+    // (preview, apply, multimodal replay) a no-op instead of decaying twice.
+    store.set_retrieval_scores(scores, lrfu_round_id());
+}
+
+uint64_t llama_memory_kvmem::lrfu_round_id() const {
+    // A new ORA round starts whenever the working-set layout changes (a
+    // selection was applied) or the context grew. Two scoring passes inside the
+    // same round share both, so the second one republishes KS without decaying.
+    return (attention_epoch_ << 32) | static_cast<uint64_t>(store_n_tokens());
 }
 
 void llama_memory_kvmem::retr_perf_print() {

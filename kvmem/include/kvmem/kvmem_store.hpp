@@ -63,6 +63,13 @@ struct KvMemBlock {
     double   profile_score = 0.0;    // window-local cumulative attention heat
     double   retrieval_score = 0.0;  // global retrieval score
 
+    // ActKV (arXiv:2609.31395, Sec. 5.2 Alg. 1) action-oriented keep score:
+    //   KS_t = lambda * KS_{t-1} + (top-p hit ? retrieval_t : 0)
+    // Non-negative by construction. When KvMemStoreConfig::action_lrfu is on the
+    // selector ranks with attn_score, which carries this value; retrieval_score
+    // keeps the one-shot score for diagnostics and the quota selector.
+    double   lrfu_score = 0.0;
+
     uint32_t orig_pos_end() const { return orig_pos_start + n_tokens; }
 };
 
@@ -244,6 +251,18 @@ struct KvMemStoreConfig {
     uint32_t sink_blocks = 1;        // --kvmem-sink-blocks (always-kept prefix)
     uint32_t recent_blocks = 0;      // --kvmem-recent-blocks (always-kept suffix);
                                      // 0 => keep no suffix blocks unconditionally
+
+    // ActKV (arXiv:2609.31395) action-oriented eviction. Opt-in; off keeps the
+    // historical one-shot retrieval ranking byte-identical.
+    //   KS_t(i) = lrfu_lambda * KS_{t-1}(i) + (hit at t ? retrieval_t(i) : 0)
+    // A block is a hit when its retrieval score ranks inside the top
+    // lrfu_top_frac fraction of scored blocks (the paper's p = 90%); with
+    // lrfu_top_frac >= 1 every scored block counts as a hit.
+    // Defaults follow the paper's tuned configuration: lambda = 0.5, p = 90%.
+    bool   action_lrfu   = false;    // --kvmem-action-lrfu
+    float  lrfu_lambda   = 0.50f;    // --kvmem-lrfu-lambda
+    float  lrfu_top_frac = 0.90f;    // --kvmem-lrfu-top-frac
+
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
@@ -439,7 +458,28 @@ public:
     // Explicit retrieval scores for selector plugins. This currently aliases
     // set_attn_scores for backwards compatibility, but also preserves the
     // retrieval/profile split used by the quota selector.
-    void set_retrieval_scores(const std::vector<double> &scores);
+    //
+    // ActKV: when KvMemStoreConfig::action_lrfu is on, this ALSO folds the
+    // one-shot score into the temporal keep score (Alg. 1) and publishes KS as
+    // attn_score, so every backend that only calls this entry point (llama.cpp
+    // and ninfer alike) gets the same action-oriented ranking. `round_id`
+    // identifies the compression round: a repeat with the same non-zero id is a
+    // no-op that still republishes KS, so preview/apply passes stay consistent.
+    // round_id == 0 means "every call is a new round" (single-reselect callers).
+    void set_retrieval_scores(const std::vector<double> &scores,
+                              uint64_t round_id = 0);
+
+    // ActKV Alg. 1 steps 3-4, applied directly. `scores` is the per-block
+    // action-region retrieval score for this ORA round, indexed by block_id.
+    //   KS[hit ] <- lambda * KS[hit ] + score[hit ]
+    //   KS[miss] <- lambda * KS[miss]
+    // KS is clamped at 0 (the paper's AttnScore is a non-negative attention
+    // mass, so a negative keep score would permanently sink a block).
+    void accumulate_lrfu(const std::vector<double> &scores, uint64_t round_id = 0);
+
+    // Drop every keep score (new session, prefix rewrite). Without this a
+    // shrunk-then-regrown block keeps stale heat forever.
+    void reset_lrfu();
 
     void set_block_tier(uint32_t block_id, KvTier tier,
                         int32_t cpu_slot = -1,
@@ -491,6 +531,9 @@ private:
     uint32_t runtime_select_budget_ = 0;
     std::vector<KvMemBlock> blocks_;
     uint32_t total_tokens_ = 0;  // total appended context length
+    // Last compression round whose ActKV keep-score update was applied.
+    uint64_t lrfu_last_round_ = 0;
+    bool     lrfu_round_seen_ = false;
 };
 
 } // namespace kvmem

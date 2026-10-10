@@ -39,6 +39,10 @@ static void print_usage(const char * argv0) {
             "  --kvmem-sink-tokens N      always-kept prefix; 0 = one block\n"
             "  --kvmem-recent-tokens N    always-kept suffix blocks (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
+            "  --kvmem-action-lrfu        ActKV action-oriented LRFU retention (default off)\n"
+            "  --kvmem-lrfu-lambda F      LRFU decay lambda, 0 < F < 1 (default 0.50)\n"
+            "  --kvmem-lrfu-top-frac F    hit fraction kept per round, 0 < F <= 1 (default 0.90)\n"
+            "  --kvmem-score-agg NAME     GQA query aggregation: mean | max (default mean)\n"
             "  --kvmem-query-last N       last N prompt tokens are the retrieval query (default 64)\n"
             "  --kvmem-force-substr S     force-select the block containing substring S\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
@@ -169,6 +173,14 @@ int main(int argc, char ** argv) {
             } else {
                 kparams.method = 0;
             }
+        } else if (eq(arg, "--kvmem-action-lrfu")) {
+            kparams.action_lrfu = true;
+        } else if (eq(arg, "--kvmem-lrfu-lambda")) {
+            kparams.lrfu_lambda = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--kvmem-lrfu-top-frac")) {
+            kparams.lrfu_top_frac = std::strtof(need(arg), nullptr);
+        } else if (eq(arg, "--kvmem-score-agg")) {
+            kparams.score_agg = eq(need(arg), "max") ? 1 : 0;
         } else if (eq(arg, "--kvmem-query-last")) {
             query_last = std::atoi(need(arg));
         } else if (eq(arg, "--kvmem-force-substr")) {

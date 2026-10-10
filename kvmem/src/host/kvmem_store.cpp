@@ -240,8 +240,80 @@ void KvMemStore::set_attn_scores(const std::vector<double> &scores) {
     set_retrieval_scores(scores);
 }
 
-void KvMemStore::set_retrieval_scores(const std::vector<double> &scores) {
+void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
+                                 uint64_t round_id) {
     const uint32_t n = block_count();
+    if (n == 0) return;
+
+    // One compression round == one keep-score update. Scoring may be re-run
+    // inside the same round (preview + apply + multimodal replay); every repeat
+    // used to decay the pool again and re-add the same score, which turned
+    // "frequency" into "how many times the code was called". On a repeat we only
+    // republish KS so the ranking stays identical between the passes.
+    if (round_id != 0) {
+        if (lrfu_round_seen_ && lrfu_last_round_ == round_id) {
+            for (auto & b : blocks_) b.attn_score = b.lrfu_score;
+            return;
+        }
+        lrfu_last_round_ = round_id;
+        lrfu_round_seen_ = true;
+    }
+
+    const uint32_t n_score = std::min<uint32_t>(
+        static_cast<uint32_t>(scores.size()), n);
+    // Top-p hit mask (paper: p = 90%). The threshold is the score at rank
+    // (1 - p) * N in ascending order, so exactly the top p fraction counts as a
+    // hit (ties may widen it slightly). p >= 1 disables the threshold: every
+    // scored block is a hit.
+    const double p = (cfg_.lrfu_top_frac > 0.0f && cfg_.lrfu_top_frac < 1.0f)
+        ? static_cast<double>(cfg_.lrfu_top_frac) : 1.0;
+    const bool thresholded = p < 1.0 && n_score > 0;
+    double threshold = 0.0;
+    if (thresholded) {
+        const double want = (1.0 - p) * static_cast<double>(n_score);
+        size_t rank = static_cast<size_t>(want);
+        if (rank >= n_score) rank = n_score - 1;   // guard: p -> 0
+        std::vector<double> tmp(scores.begin(), scores.begin() + n_score);
+        std::nth_element(tmp.begin(), tmp.begin() + rank, tmp.end());
+        threshold = tmp[rank];
+    }
+
+    const double lambda = static_cast<double>(cfg_.lrfu_lambda);
+    for (uint32_t i = 0; i < n; ++i) {
+        double ks = lambda * blocks_[i].lrfu_score;
+        if (i < n_score && (!thresholded || scores[i] >= threshold)) {
+            ks += scores[i];
+        }
+        // AttnScore is a non-negative attention mass. Clamping at 0 keeps a
+        // block that went cold able to come back; a negative keep score would
+        // rank it last forever (and nothing resets it while it stays resident).
+        if (ks < 0.0) ks = 0.0;
+        blocks_[i].lrfu_score = ks;
+        blocks_[i].attn_score = ks;
+    }
+}
+
+void KvMemStore::reset_lrfu() {
+    for (auto & b : blocks_) {
+        b.lrfu_score = 0.0;
+        b.attn_score = 0.0;
+    }
+    lrfu_last_round_ = 0;
+    lrfu_round_seen_ = false;
+}
+
+void KvMemStore::set_retrieval_scores(const std::vector<double> &scores,
+                                      uint64_t round_id) {
+    const uint32_t n = block_count();
+    if (cfg_.action_lrfu) {
+        // Keep the one-shot score available (diagnostics, quota selector), then
+        // fold it into the temporal keep score which becomes the ranking signal.
+        for (uint32_t i = 0; i < n; ++i) {
+            blocks_[i].retrieval_score = (i < scores.size()) ? scores[i] : 0.0;
+        }
+        accumulate_lrfu(scores, round_id);
+        return;
+    }
     for (uint32_t i = 0; i < n; ++i) {
         blocks_[i].retrieval_score = (i < scores.size()) ? scores[i] : 0.0;
         blocks_[i].attn_score = blocks_[i].retrieval_score;

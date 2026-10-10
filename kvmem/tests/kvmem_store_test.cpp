@@ -1128,6 +1128,128 @@ static void test_media_suffix_over_budget() {
     CHECK(threw);
 }
 
+// --- ActKV (arXiv:2609.31395 Sec. 5.2 Alg. 1): action-oriented LRFU ---------
+//   KS_t(i) = lambda * KS_{t-1}(i) + (hit at t ? retrieval_t(i) : 0)
+
+static void test_lrfu_defaults_match_actkv() {
+    KvMemStoreConfig cfg;
+    CHECK(cfg.action_lrfu == false);
+    CHECK(cfg.lrfu_lambda > 0.49f && cfg.lrfu_lambda < 0.51f);
+    CHECK(cfg.lrfu_top_frac > 0.89f && cfg.lrfu_top_frac < 0.91f);
+}
+
+static void test_lrfu_off_keeps_one_shot_ranking() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;   // action_lrfu defaults off
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({1.0, 2.0, 3.0, 4.0});
+    for (uint32_t i = 0; i < 4; ++i) {
+        CHECK(s.blocks()[i].retrieval_score == double(i + 1));
+        CHECK(s.blocks()[i].attn_score == double(i + 1));
+        CHECK(s.blocks()[i].lrfu_score == 0.0);
+    }
+}
+
+static void test_lrfu_accumulates_and_decays() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});
+    CHECK(s.blocks()[0].lrfu_score == 1.0);
+    CHECK(s.blocks()[0].attn_score == 1.0);   // KS is the ranking signal
+    CHECK(s.blocks()[0].retrieval_score == 1.0);
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});
+    CHECK(s.blocks()[0].lrfu_score == 1.5);   // 0.5*1.0 + 1.0
+    CHECK(s.blocks()[1].lrfu_score == 0.0);
+}
+
+static void test_lrfu_round_id_is_idempotent() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 7);
+    CHECK(s.blocks()[0].lrfu_score == 1.0);
+    // A repeat inside the same round must not decay or re-add; it only keeps
+    // attn_score (the ranking signal) equal to KS.
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 7);
+    CHECK(s.blocks()[0].lrfu_score == 1.0);
+    CHECK(s.blocks()[0].attn_score == 1.0);
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 8);
+    CHECK(s.blocks()[0].lrfu_score == 1.5);
+}
+
+static void test_lrfu_top_frac_masks_low_scores() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true;
+    cfg.lrfu_lambda = 0.0f;      // no carry-over: isolate the hit mask
+    cfg.lrfu_top_frac = 0.5f;    // top 50% of 10 blocks = the 5 highest
+    KvMemStore s(cfg);
+    s.register_append(128 * 10);
+    std::vector<double> scores(10);
+    for (int i = 0; i < 10; ++i) scores[i] = double(i);
+    s.set_retrieval_scores(scores);
+    for (uint32_t i = 0; i < 10; ++i) {
+        const double expect = i >= 5 ? double(i) : 0.0;
+        CHECK(s.blocks()[i].lrfu_score == expect);
+    }
+}
+
+static void test_lrfu_never_goes_negative_and_can_recover() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({-1.0, -2.0, 0.5, 0.0});
+    for (uint32_t i = 0; i < 4; ++i) CHECK(s.blocks()[i].lrfu_score >= 0.0);
+    CHECK(s.blocks()[2].lrfu_score == 0.5);
+    // A block that scored badly is not sunk forever.
+    s.set_retrieval_scores({2.0, 0.0, 0.0, 0.0});
+    CHECK(s.blocks()[0].lrfu_score == 2.0);
+}
+
+static void test_lrfu_reset_clears_keep_scores() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({1.0, 1.0, 0.0, 0.0});
+    s.reset_lrfu();
+    for (uint32_t i = 0; i < 4; ++i) {
+        CHECK(s.blocks()[i].lrfu_score == 0.0);
+        CHECK(s.blocks()[i].attn_score == 0.0);
+    }
+}
+
+// Action mode must change WHICH blocks survive a tight budget: a block with a
+// weaker current score but a strong recent history outranks a fresher one.
+static void test_lrfu_changes_selection_order() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.select_budget = 128 * 2;   // sink(1) + one retrieved block
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 0;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 8);
+    s.set_retrieval_scores({0, 0, 0, 0, 0, 1.0, 0.0, 0}, 1);   // block 5 strong
+    s.set_retrieval_scores({0, 0, 0, 0, 0, 0.0, 0.4, 0}, 2);   // block 6 now best
+    // KS: block5 = 0.5, block6 = 0.4 -> the history keeps block 5 selected.
+    auto picked = s.pick_topk_blocks();
+    CHECK(std::find(picked.begin(), picked.end(), 0u) != picked.end());
+    CHECK(std::find(picked.begin(), picked.end(), 5u) != picked.end());
+    CHECK(std::find(picked.begin(), picked.end(), 6u) == picked.end());
+
+    // Same scores with ActKV off: the one-shot winner (block 6) is selected.
+    KvMemStoreConfig one_shot = cfg; one_shot.action_lrfu = false;
+    KvMemStore t(one_shot);
+    t.register_append(128 * 8);
+    t.set_retrieval_scores({0, 0, 0, 0, 0, 0.0, 0.4, 0});
+    auto picked2 = t.pick_topk_blocks();
+    CHECK(std::find(picked2.begin(), picked2.end(), 6u) != picked2.end());
+    CHECK(std::find(picked2.begin(), picked2.end(), 5u) == picked2.end());
+}
+
 int main() {
     test_media_suffix_over_budget();
     test_media_groups_with_shared_boundary();
@@ -1162,6 +1284,14 @@ int main() {
     test_deltanet_config_and_scores();
     test_round_groups_are_selected_whole();
     test_round_groups_charge_shared_boundary_once();
+    test_lrfu_defaults_match_actkv();
+    test_lrfu_off_keeps_one_shot_ranking();
+    test_lrfu_accumulates_and_decays();
+    test_lrfu_round_id_is_idempotent();
+    test_lrfu_top_frac_masks_low_scores();
+    test_lrfu_never_goes_negative_and_can_recover();
+    test_lrfu_reset_clears_keep_scores();
+    test_lrfu_changes_selection_order();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

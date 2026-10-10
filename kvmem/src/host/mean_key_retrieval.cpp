@@ -1,13 +1,15 @@
 #include "kvmem/mean_key_retrieval.hpp"
 #include "kvmem/raw_kv_store.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
 namespace kvmem {
 std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t blocks,
-                                               MeanKeyQueryView query) {
+                                               MeanKeyQueryView query,
+                                               MeanKeyGroupReduce group_reduce) {
     const uint64_t key_width = uint64_t(query.kv_heads) * query.head_dim;
     const uint64_t query_width = uint64_t(query.query_heads) * query.head_dim;
     if (!query.sums || !query.token_counts || !query.layers || !query.head_dim ||
@@ -17,28 +19,49 @@ std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t b
         throw std::invalid_argument("mean-key retrieval: incompatible query/key geometry");
     }
     const auto group = query.query_heads / query.kv_heads;
-    std::vector<float> means(static_cast<size_t>(key_width) * query.layers, 0.0f);
-    std::vector<float> norms(static_cast<size_t>(query.kv_heads) * query.layers, 0.0f);
+    // ActKV Alg. 3 step 8. Max keeps one probe per query head and reduces each
+    // GQA group with a maximum; Mean folds the group first (historical policy).
+    const bool reduce_max = group_reduce == MeanKeyGroupReduce::Max;
+    const uint32_t probe_heads = reduce_max ? query.query_heads : query.kv_heads;
+    const uint64_t probe_width = uint64_t(probe_heads) * query.head_dim;
+    std::vector<float> probes(static_cast<size_t>(probe_width) * query.layers, 0.0f);
+    std::vector<float> norms(static_cast<size_t>(probe_heads) * query.layers, 0.0f);
     uint32_t active_layers = 0;
     for (uint32_t layer = 0; layer < query.layers; ++layer) {
         if (!query.token_counts[layer]) continue;
         ++active_layers;
-        const float inv = 1.0f / static_cast<float>(uint64_t(query.token_counts[layer]) * group);
-        for (uint32_t head = 0; head < query.kv_heads; ++head) {
-            float norm = 0.0f;
-            for (uint32_t d = 0; d < query.head_dim; ++d) {
-                float sum = 0.0f;
-                for (uint32_t g = 0; g < group; ++g) {
+        const float inv = 1.0f / static_cast<float>(query.token_counts[layer]);
+        if (reduce_max) {
+            for (uint32_t qh = 0; qh < query.query_heads; ++qh) {
+                float norm = 0.0f;
+                for (uint32_t d = 0; d < query.head_dim; ++d) {
                     const float value = query.sums[layer * query_width +
-                        (head * group + g) * query.head_dim + d];
+                        qh * query.head_dim + d];
                     if (!std::isfinite(value)) throw std::invalid_argument("nonfinite mean-key query");
-                    sum += value;
+                    const float mean = value * inv;
+                    probes[layer * probe_width + qh * query.head_dim + d] = mean;
+                    norm += mean * mean;
                 }
-                const float mean = sum * inv;
-                means[layer * key_width + head * query.head_dim + d] = mean;
-                norm += mean * mean;
+                norms[layer * probe_heads + qh] = std::sqrt(norm);
             }
-            norms[layer * query.kv_heads + head] = std::sqrt(norm);
+        } else {
+            const float invg = inv / static_cast<float>(group);
+            for (uint32_t head = 0; head < query.kv_heads; ++head) {
+                float norm = 0.0f;
+                for (uint32_t d = 0; d < query.head_dim; ++d) {
+                    float sum = 0.0f;
+                    for (uint32_t g = 0; g < group; ++g) {
+                        const float value = query.sums[layer * query_width +
+                            (head * group + g) * query.head_dim + d];
+                        if (!std::isfinite(value)) throw std::invalid_argument("nonfinite mean-key query");
+                        sum += value;
+                    }
+                    const float mean = sum * invg;
+                    probes[layer * probe_width + head * query.head_dim + d] = mean;
+                    norm += mean * mean;
+                }
+                norms[layer * probe_heads + head] = std::sqrt(norm);
+            }
         }
     }
     std::vector<double> scores(blocks, 0.0);
@@ -52,14 +75,33 @@ std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t b
             keys.mean_k(block, layer, key.data());
             double layer_score = 0.0;
             for (uint32_t head = 0; head < query.kv_heads; ++head) {
-                float dot = 0.0f, norm = 0.0f;
+                float norm = 0.0f;
                 for (uint32_t d = 0; d < query.head_dim; ++d) {
                     const float value = key[head * query.head_dim + d];
                     if (!std::isfinite(value)) throw std::invalid_argument("nonfinite mean-key index");
-                    dot += means[layer * key_width + head * query.head_dim + d] * value;
                     norm += value * value;
                 }
-                layer_score += dot / (norms[layer * query.kv_heads + head] * std::sqrt(norm) + 1e-6f);
+                const float key_norm = std::sqrt(norm);
+                // One probe in Mean mode, the whole group in Max mode.
+                const uint32_t first = reduce_max ? head * group : head;
+                const uint32_t last  = reduce_max
+                    ? std::min(head * group + group, query.query_heads)
+                    : head + 1;
+                double best = 0.0;
+                for (uint32_t probe = first; probe < last; ++probe) {
+                    float dot = 0.0f;
+                    const float * q = probes.data() +
+                        layer * probe_width + probe * query.head_dim;
+                    const float * k = key.data() + head * query.head_dim;
+                    for (uint32_t d = 0; d < query.head_dim; ++d) {
+                        dot += q[d] * k[d];
+                    }
+                    const double cosine =
+                        dot / (double(norms[layer * probe_heads + probe]) *
+                                   double(key_norm) + 1e-6);
+                    if (probe == first || cosine > best) best = cosine;
+                }
+                layer_score += best;
             }
             total += layer_score / query.kv_heads;
         }

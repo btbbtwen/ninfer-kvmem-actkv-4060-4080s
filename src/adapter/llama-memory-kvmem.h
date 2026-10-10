@@ -308,6 +308,11 @@ private:
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
                                   const void * host, uint64_t bytes);
     void score_retrieval();
+    // ActKV (arXiv:2609.31395) Alg. 1 round stamp: (attention epoch, rows).
+    // Scoring can run several times inside one working-set round (preview,
+    // apply, replay); repeats share this id and must not decay the keep score
+    // twice.
+    uint64_t lrfu_round_id() const;
     bool read_gpu_block(uint32_t block_id, uint32_t il, bool is_k, std::vector<float> & out) const;
     static void kv_stats(const char * tag, const float * a, const float * b, size_t n);
     static void tensor_to_f32_token_major(const struct ggml_tensor * t, std::vector<float> & out, int64_t * read_us = nullptr);
@@ -454,6 +459,9 @@ private:
     bool keep_selected_ = false;
     bool prefill_capture_ = true;
     int32_t method_ = 0;
+    // ActKV GQA aggregation for the query side of retrieval scoring:
+    // 0 = folded mean (historical), 1 = max over the group's query heads.
+    int32_t score_agg_ = 0;
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
     int32_t force_pos_ = -1;
