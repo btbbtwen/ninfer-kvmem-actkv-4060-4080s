@@ -255,9 +255,11 @@ struct KvMemStoreConfig {
     // ActKV (arXiv:2609.31395) action-oriented eviction. Opt-in; off keeps the
     // historical one-shot retrieval ranking byte-identical.
     //   KS_t(i) = lrfu_lambda * KS_{t-1}(i) + (hit at t ? retrieval_t(i) : 0)
-    // A block is a hit when its retrieval score ranks inside the top
-    // lrfu_top_frac fraction of scored blocks (the paper's p = 90%); with
-    // lrfu_top_frac >= 1 every scored block counts as a hit.
+    // A block is a hit when it carries a positive retrieval score AND ranks
+    // inside the top lrfu_top_frac fraction of the positive scores (the paper's
+    // p = 90%). A block with no positive evidence is never a hit, so a keep score
+    // cannot grow from page age alone -- see accumulate_lrfu for why that matters
+    // at large context.
     // Defaults follow the paper's tuned configuration: lambda = 0.5, p = 90%.
     bool   action_lrfu   = false;    // --kvmem-action-lrfu
     float  lrfu_lambda   = 0.50f;    // --kvmem-lrfu-lambda

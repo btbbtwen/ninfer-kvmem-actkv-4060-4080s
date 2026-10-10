@@ -267,30 +267,43 @@ void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
 
     const uint32_t n_score = std::min<uint32_t>(
         static_cast<uint32_t>(scores.size()), n);
-    // Top-p hit mask (paper: p = 90%). The threshold is the score at rank
-    // (1 - p) * N in ascending order, so exactly the top p fraction counts as a
-    // hit (ties may widen it slightly). p >= 1 disables the threshold: every
-    // scored block is a hit.
+    // Top-p hit mask (paper: p = 90%), taken over the scores that carry positive
+    // evidence.
+    //
+    // KVMem re-scores every resident block in every round, so it is NOT the
+    // paper's small action region: a threshold over the whole pool marks roughly
+    // p of the pool a hit even in a round where the query matches nothing. KS
+    // would then grow with page AGE instead of relevance, and pick_topk would
+    // start preferring the oldest blocks -- exactly the ones whose host records
+    // the tier has already dropped. Staging one of those in is what corrupts the
+    // window at large context. Requiring scores[i] > 0 and ranking the threshold
+    // among the positive scores keeps "hit" meaning "the model cared this round".
+    // A round with no positive score is a pure decay.
     const double p = (cfg_.lrfu_top_frac > 0.0f && cfg_.lrfu_top_frac < 1.0f)
         ? static_cast<double>(cfg_.lrfu_top_frac) : 1.0;
-    const bool thresholded = p < 1.0 && n_score > 0;
+    lrfu_scratch_.clear();
+    for (uint32_t i = 0; i < n_score; ++i) {
+        if (scores[i] > 0.0) lrfu_scratch_.push_back(scores[i]);
+    }
+    const size_t n_pos = lrfu_scratch_.size();
+    const bool thresholded = p < 1.0 && n_pos > 1;
     double threshold = 0.0;
-    if (thresholded) {
-        const double want = (1.0 - p) * static_cast<double>(n_score);
+    if (n_pos > 0) {
+        const double want = (1.0 - p) * static_cast<double>(n_pos);
         size_t rank = static_cast<size_t>(want);
-        if (rank >= n_score) rank = n_score - 1;   // guard: p -> 0
+        if (rank >= n_pos) rank = n_pos - 1;   // guard: p -> 0
         // The input is const, so the threshold needs a copy; reuse the member
         // buffer instead of allocating one per call.
-        lrfu_scratch_.assign(scores.begin(), scores.begin() + n_score);
         std::nth_element(lrfu_scratch_.begin(), lrfu_scratch_.begin() + rank,
                          lrfu_scratch_.end());
-        threshold = lrfu_scratch_[rank];
+        threshold = thresholded ? lrfu_scratch_[rank] : 0.0;
     }
 
     const double lambda = static_cast<double>(cfg_.lrfu_lambda);
     for (uint32_t i = 0; i < n; ++i) {
         double ks = lambda * blocks_[i].lrfu_score;
-        if (i < n_score && (!thresholded || scores[i] >= threshold)) {
+        if (i < n_score && scores[i] > 0.0 &&
+            (!thresholded || scores[i] >= threshold)) {
             ks += scores[i];
         }
         // AttnScore is a non-negative attention mass. Clamping at 0 keeps a

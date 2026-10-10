@@ -1241,6 +1241,42 @@ static void test_lrfu_reset_clears_keep_scores() {
     }
 }
 
+// A block with no positive evidence must not build a keep score across rounds.
+// KVMem re-scores the whole resident pool every round, so if zero-score blocks
+// counted as hits their KS would grow with page AGE and outrank the blocks the
+// query actually matched -- and at large context the oldest blocks are the ones
+// whose host records the tier has already dropped.
+static void test_lrfu_zero_scores_do_not_accumulate() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 0.90f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 8);
+    std::vector<double> scores(8, 0.0);
+    scores[7] = 1.0;                     // only block 7 has evidence
+    s.set_retrieval_scores(scores, 1);
+    s.set_retrieval_scores(scores, 2);
+    s.set_retrieval_scores(scores, 3);
+    CHECK(s.blocks()[7].lrfu_score == 1.75);   // 0.5*(0.5*1+1)+1
+    for (uint32_t i = 0; i < 7; ++i) {
+        CHECK(s.blocks()[i].lrfu_score == 0.0);
+        CHECK(s.blocks()[i].attn_score == 0.0);
+    }
+}
+
+// A round where nothing matches must be a pure decay, not a rescaling of the
+// whole pool.
+static void test_lrfu_round_without_evidence_only_decays() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 0.90f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({0.0, 2.0, 0.0, 0.0}, 1);
+    CHECK(s.blocks()[1].lrfu_score == 2.0);
+    s.set_retrieval_scores({0.0, 0.0, 0.0, 0.0}, 2);
+    CHECK(s.blocks()[1].lrfu_score == 1.0);    // decayed, nothing added
+    CHECK(s.blocks()[0].lrfu_score == 0.0);
+}
+
 // Action mode must change WHICH blocks survive a tight budget: a block with a
 // weaker current score but a strong recent history outranks a fresher one.
 static void test_lrfu_changes_selection_order() {
@@ -1310,6 +1346,8 @@ int main() {
     test_lrfu_derived_round_is_idempotent();
     test_lrfu_top_frac_masks_low_scores();
     test_lrfu_never_goes_negative_and_can_recover();
+    test_lrfu_zero_scores_do_not_accumulate();
+    test_lrfu_round_without_evidence_only_decays();
     test_lrfu_reset_clears_keep_scores();
     test_lrfu_changes_selection_order();
 
