@@ -70,22 +70,32 @@ REM This script may sit in the repository root (normal) or next to the worker
 REM in workers\ninfer (copied there, the way the llama launcher lives in its
 REM bin\ directory). ROOT must still name the repository root either way,
 REM because model.ninfer and the error text below refer to it.
+REM Plain sequential "if" tests, no "else if": cmd parses "else if" as an else
+REM whose command happens to be another if, and the set inside a skipped
+REM branch can be lost depending on how the script was invoked. That left
+REM %EXE% empty, and an empty %EXE% makes cmd fail with 9009 while the
+REM continuation line's remaining tokens are run as commands.
 set "EXE="
 set "BIN="
-if exist "%~dp0workers\ninfer\infer-kvmem-server.exe" (
+set "ROOT="
+if exist "%~dp0workers\ninfer\infer-kvmem-server.exe" if not defined BIN (
     set "ROOT=%~dp0"
     set "BIN=%~dp0workers\ninfer"
-) else if exist "%~dp0infer-kvmem-server.exe" (
+)
+if exist "%~dp0infer-kvmem-server.exe" if not defined BIN (
     set "ROOT=%~dp0..\.."
     set "BIN=%~dp0"
-) else if exist "%~dp0..\..\workers\ninfer\infer-kvmem-server.exe" (
+)
+if exist "%~dp0..\..\workers\ninfer\infer-kvmem-server.exe" if not defined BIN (
     set "ROOT=%~dp0..\.."
     set "BIN=%~dp0..\..\workers\ninfer"
-) else if exist "%~dp0..\workers\ninfer\infer-kvmem-server.exe" (
+)
+if exist "%~dp0..\workers\ninfer\infer-kvmem-server.exe" if not defined BIN (
     set "ROOT=%~dp0.."
     set "BIN=%~dp0..\workers\ninfer"
 )
 if defined BIN set "EXE=%BIN%\infer-kvmem-server.exe"
+if not defined ROOT set "ROOT=%~dp0"
 if not defined EXE (
     echo ERROR: ninfer worker not found. Looked in:
     echo   %~dp0workers\ninfer
@@ -119,6 +129,25 @@ REM ---- GPU: ninfer wants UUIDs, comma separated in stage order --------
 REM An existing CUDA_VISIBLE_DEVICES wins; otherwise this box's RTX 5060 Ti.
 if defined CUDA_VISIBLE_DEVICES (set "GPU=%CUDA_VISIBLE_DEVICES%") else (set "GPU=GPU-dba26dd9-930f-1b01-2b05-22c1fca6cdce")
 set "CUDA_VISIBLE_DEVICES=%GPU%"
+
+REM ---- last guard before the command line -----------------------------
+REM An empty %EXE% would make cmd run "" and then treat the continuation
+REM line's tokens as commands, reporting "not recognized ... 9009" for a
+REM parameter instead of naming the real problem.
+if not defined EXE (
+    echo ERROR: worker path resolved empty; cannot start.
+    echo   BIN=%BIN%
+    echo   ROOT=%ROOT%
+    pause
+    exit /b 2
+)
+if not exist "%EXE%" (
+    echo ERROR: worker missing at resolved path:
+    echo   %EXE%
+    pause
+    exit /b 2
+)
+if not defined BIN set "BIN=%~dp0"
 
 cd /d "%BIN%"
 
