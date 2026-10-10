@@ -36,3 +36,7 @@ CLAUDE.md
 *.nkm
 /dsh-*/
 /results/
+
+# Locally staged backend workers (packaging output: the exe is covered by *.exe,
+# but its FFmpeg/curl/cuBLAS DLLs are hundreds of MB and are rebuilt here).
+/workers/

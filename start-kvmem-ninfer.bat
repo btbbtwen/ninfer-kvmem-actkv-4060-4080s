@@ -44,21 +44,38 @@ if not exist "%PS%" (
     exit /b 2
 )
 
-REM Put a model with text, Vision and MTP in the repository root as
-REM model.ninfer, or edit MODEL below. Use English paths and filenames.
+REM ---- model: repo-root model.ninfer, else the artifact this box keeps ------
+REM Edit MODEL to your own artifact. Use English paths and filenames.
 set "MODEL=%ROOT%model.ninfer"
+if not exist "%MODEL%" set "MODEL=I:\llama\ninfer-server-rtx50-sm120a-ui\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer"
 if not exist "%MODEL%" (
     echo ERROR: ninfer model not found:
     echo   %MODEL%
-    echo Copy your .ninfer artifact there, or edit MODEL in this file.
+    echo Put a .ninfer artifact in the repository root as model.ninfer,
+    echo or edit MODEL in this file.
     pause
     exit /b 2
 )
 
-REM GPU UUIDs in stage order, comma separated. Defaults to CUDA_VISIBLE_DEVICES
-REM or 0. Uncomment and edit to pin specific cards (UUIDs, not indices):
+REM ---- build output: workers\ninfer\ninfer-kvmem-server.exe -----------------
+set "WORKER=%ROOT%workers\ninfer\ninfer-kvmem-server.exe"
+if not exist "%WORKER%" (
+    echo ERROR: ninfer worker not built yet:
+    echo   %WORKER%
+    echo.
+    echo Build it with:
+    echo   git submodule update --init --depth 1
+    echo   scripts\windows\build-backends.ps1 -Backend ninfer -CudaPath "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4" -Jobs 10
+    echo   then copy the built ninfer-serve.exe to that path.
+    echo.
+    pause
+    exit /b 2
+)
+
+REM ---- GPU: ninfer wants UUIDs, in stage order, comma separated -------------
+REM Defaults to CUDA_VISIBLE_DEVICES, then to this box's RTX 5060 Ti UUID.
 set "GPU=%CUDA_VISIBLE_DEVICES%"
-if not defined GPU set "GPU=0"
+if not defined GPU set "GPU=GPU-dba26dd9-930f-1b01-2b05-22c1fca6cdce"
 
 echo Starting ninfer backend at http://127.0.0.1:18200/  (Ctrl+C stops it)
 echo.
