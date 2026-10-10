@@ -1155,11 +1155,11 @@ static void test_lrfu_accumulates_and_decays() {
     cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
     KvMemStore s(cfg);
     s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 1);
     CHECK(s.blocks()[0].lrfu_score == 1.0);
     CHECK(s.blocks()[0].attn_score == 1.0);   // KS is the ranking signal
     CHECK(s.blocks()[0].retrieval_score == 1.0);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 2);
     CHECK(s.blocks()[0].lrfu_score == 1.5);   // 0.5*1.0 + 1.0
     CHECK(s.blocks()[1].lrfu_score == 0.0);
 }
@@ -1201,12 +1201,31 @@ static void test_lrfu_never_goes_negative_and_can_recover() {
     cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
     KvMemStore s(cfg);
     s.register_append(128 * 4);
-    s.set_retrieval_scores({-1.0, -2.0, 0.5, 0.0});
+    s.set_retrieval_scores({-1.0, -2.0, 0.5, 0.0}, 1);
     for (uint32_t i = 0; i < 4; ++i) CHECK(s.blocks()[i].lrfu_score >= 0.0);
     CHECK(s.blocks()[2].lrfu_score == 0.5);
     // A block that scored badly is not sunk forever.
-    s.set_retrieval_scores({2.0, 0.0, 0.0, 0.0});
+    s.set_retrieval_scores({2.0, 0.0, 0.0, 0.0}, 2);
     CHECK(s.blocks()[0].lrfu_score == 2.0);
+}
+
+// A caller with no round clock of its own (the ninfer backend scores out of
+// prepare_window) passes round_id == 0. The store then derives the round from
+// the block frontier, so re-scoring the SAME frontier must not decay the pool
+// twice, while the next append starts a new round.
+static void test_lrfu_derived_round_is_idempotent() {
+    KvMemStoreConfig cfg; cfg.block_tokens = 128;
+    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
+    KvMemStore s(cfg);
+    s.register_append(128 * 4);
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});   // derived round = frontier 512
+    CHECK(s.blocks()[0].lrfu_score == 1.0);
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});   // same frontier: a repeat
+    CHECK(s.blocks()[0].lrfu_score == 1.0);
+    CHECK(s.blocks()[0].attn_score == 1.0);
+    s.register_append(128);                          // frontier grew: new round
+    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});
+    CHECK(s.blocks()[0].lrfu_score == 1.5);
 }
 
 static void test_lrfu_reset_clears_keep_scores() {
@@ -1288,6 +1307,7 @@ int main() {
     test_lrfu_off_keeps_one_shot_ranking();
     test_lrfu_accumulates_and_decays();
     test_lrfu_round_id_is_idempotent();
+    test_lrfu_derived_round_is_idempotent();
     test_lrfu_top_frac_masks_low_scores();
     test_lrfu_never_goes_negative_and_can_recover();
     test_lrfu_reset_clears_keep_scores();

@@ -463,9 +463,15 @@ public:
     // one-shot score into the temporal keep score (Alg. 1) and publishes KS as
     // attn_score, so every backend that only calls this entry point (llama.cpp
     // and ninfer alike) gets the same action-oriented ranking. `round_id`
-    // identifies the compression round: a repeat with the same non-zero id is a
-    // no-op that still republishes KS, so preview/apply passes stay consistent.
-    // round_id == 0 means "every call is a new round" (single-reselect callers).
+    // identifies the compression round: a repeat with the same id is a no-op
+    // that still republishes KS, so preview/apply passes stay consistent.
+    //
+    // round_id == 0 asks the store to derive the round from the block frontier.
+    // That is what a caller with no ORA clock of its own passes -- the ninfer
+    // backend scores from prepare_window() and cannot say which round it is in.
+    // Deriving the stamp there means "context grew -> new round; same frontier ->
+    // repeat", so the guard below still protects such a caller. Callers that do
+    // have a round clock (the llama adapter) pass it explicitly.
     void set_retrieval_scores(const std::vector<double> &scores,
                               uint64_t round_id = 0);
 
@@ -475,6 +481,8 @@ public:
     //   KS[miss] <- lambda * KS[miss]
     // KS is clamped at 0 (the paper's AttnScore is a non-negative attention
     // mass, so a negative keep score would permanently sink a block).
+    // A zero `round_id` derives the round from the block frontier; see
+    // set_retrieval_scores.
     void accumulate_lrfu(const std::vector<double> &scores, uint64_t round_id = 0);
 
     // Drop every keep score (new session, prefix rewrite). Without this a
@@ -534,6 +542,9 @@ private:
     // Last compression round whose ActKV keep-score update was applied.
     uint64_t lrfu_last_round_ = 0;
     bool     lrfu_round_seen_ = false;
+    // Scratch for the top-p threshold selection. Reused so the per-round LRFU
+    // update does not heap-allocate: a caller may score once per prefill chunk.
+    std::vector<double> lrfu_scratch_;
 };
 
 } // namespace kvmem

@@ -250,14 +250,20 @@ void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
     // used to decay the pool again and re-add the same score, which turned
     // "frequency" into "how many times the code was called". On a repeat we only
     // republish KS so the ranking stays identical between the passes.
-    if (round_id != 0) {
-        if (lrfu_round_seen_ && lrfu_last_round_ == round_id) {
-            for (auto & b : blocks_) b.attn_score = b.lrfu_score;
-            return;
-        }
-        lrfu_last_round_ = round_id;
-        lrfu_round_seen_ = true;
+    //
+    // round_id == 0 has no ORA clock to read, so the block frontier stands in for
+    // it: the context grew => a new round, the same frontier => a repeat. The
+    // ninfer backend scores out of prepare_window() and can only supply this, so
+    // deriving it here is what keeps the guard effective on that path.
+    const uint64_t round = round_id != 0
+        ? round_id
+        : static_cast<uint64_t>(total_tokens_);
+    if (lrfu_round_seen_ && lrfu_last_round_ == round) {
+        for (auto & b : blocks_) b.attn_score = b.lrfu_score;
+        return;
     }
+    lrfu_last_round_ = round;
+    lrfu_round_seen_ = true;
 
     const uint32_t n_score = std::min<uint32_t>(
         static_cast<uint32_t>(scores.size()), n);
@@ -273,9 +279,12 @@ void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
         const double want = (1.0 - p) * static_cast<double>(n_score);
         size_t rank = static_cast<size_t>(want);
         if (rank >= n_score) rank = n_score - 1;   // guard: p -> 0
-        std::vector<double> tmp(scores.begin(), scores.begin() + n_score);
-        std::nth_element(tmp.begin(), tmp.begin() + rank, tmp.end());
-        threshold = tmp[rank];
+        // The input is const, so the threshold needs a copy; reuse the member
+        // buffer instead of allocating one per call.
+        lrfu_scratch_.assign(scores.begin(), scores.begin() + n_score);
+        std::nth_element(lrfu_scratch_.begin(), lrfu_scratch_.begin() + rank,
+                         lrfu_scratch_.end());
+        threshold = lrfu_scratch_[rank];
     }
 
     const double lambda = static_cast<double>(cfg_.lrfu_lambda);
