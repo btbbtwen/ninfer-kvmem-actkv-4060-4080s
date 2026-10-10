@@ -65,18 +65,38 @@ REM ====================================================================
 
 title KVMem server (ninfer backend) - Qwen3.8-27B-IQ3_S-mtp + ActKV
 
-REM ---- locate the staged worker --------------------------------------
-set "ROOT=%~dp0"
-set "BIN=%ROOT%workers\ninfer"
-set "EXE=%BIN%\infer-kvmem-server.exe"
-if not exist "%EXE%" (
-    echo ERROR: ninfer worker not found:
-    echo   %EXE%
+REM ---- locate the worker, and the repository root that owns it ---------
+REM This script may sit in the repository root (normal) or next to the worker
+REM in workers\ninfer (copied there, the way the llama launcher lives in its
+REM bin\ directory). ROOT must still name the repository root either way,
+REM because model.ninfer and the error text below refer to it.
+set "EXE="
+set "BIN="
+if exist "%~dp0workers\ninfer\infer-kvmem-server.exe" (
+    set "ROOT=%~dp0"
+    set "BIN=%~dp0workers\ninfer"
+) else if exist "%~dp0infer-kvmem-server.exe" (
+    set "ROOT=%~dp0..\.."
+    set "BIN=%~dp0"
+) else if exist "%~dp0..\..\workers\ninfer\infer-kvmem-server.exe" (
+    set "ROOT=%~dp0..\.."
+    set "BIN=%~dp0..\..\workers\ninfer"
+) else if exist "%~dp0..\workers\ninfer\infer-kvmem-server.exe" (
+    set "ROOT=%~dp0.."
+    set "BIN=%~dp0..\workers\ninfer"
+)
+if defined BIN set "EXE=%BIN%\infer-kvmem-server.exe"
+if not defined EXE (
+    echo ERROR: ninfer worker not found. Looked in:
+    echo   %~dp0workers\ninfer
+    echo   %~dp0
+    echo   %~dp0..\..\workers\ninfer
+    echo   %~dp0..\workers\ninfer
     echo.
-    echo Build it first:
+    echo Build and stage it first:
     echo   git submodule update --init --depth 1
     echo   scripts\windows\build-backends.ps1 -Backend ninfer -CudaPath "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4" -Jobs 10
-    echo   then stage build-backends\ninfer\apps\ninfer-serve.exe there as infer-kvmem-server.exe
+    echo   then copy build-backends\ninfer\apps\ninfer-serve.exe to workers\ninfer\infer-kvmem-server.exe
     echo   ^(docs\ninfer-server-build-record.md has the full recipe^)
     echo.
     pause
@@ -84,7 +104,7 @@ if not exist "%EXE%" (
 )
 
 REM ---- model: repo-root model.ninfer, else the artifact this box keeps
-set "MODEL=%ROOT%model.ninfer"
+set "MODEL=%ROOT%\model.ninfer"
 if not exist "%MODEL%" set "MODEL=I:\llama\ninfer-server-rtx50-sm120a-ui\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer"
 if not exist "%MODEL%" (
     echo ERROR: ninfer model not found:
