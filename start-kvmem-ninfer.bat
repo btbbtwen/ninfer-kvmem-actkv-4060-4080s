@@ -125,7 +125,7 @@ cd /d "%BIN%"
 "%EXE%" ^
   "%MODEL%" ^
   --host 0.0.0.0  --port 18200 ^
-  --max-context 204800  --max-concurrency 1 ^
+  --max-context 262144  --max-concurrency 1 ^
   --prefill-chunk 256  --default-max-tokens 65535 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
   --kvmem-sink-tokens 0 --kvmem-recent-tokens 64 --kvmem-sessions 1 ^
