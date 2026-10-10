@@ -8,6 +8,11 @@ REM  Same shape as start-kvmem-server.bat (llama.cpp backend): ONE command
 REM  line, every parameter written out inline. Edit a value, save, run it.
 REM  Ctrl+C stops the server.
 REM
+REM  EDITING RULE: every parameter line except the LAST one must end with " ^".
+REM  A trailing "^" followed by a blank line sends an empty argument, and the
+REM  server then exits with 'unknown argument: ' before it loads anything.
+REM  The last parameter line must have no "^" at all.
+REM
 REM      start-kvmem-server.bat           llama.cpp backend, ActKV ON
 REM      start-kvmem-server-noactkv.bat   same line with the ActKV flags removed
 REM      start-kvmem-ninfer.bat           THIS FILE - ninfer backend, ActKV ON
@@ -101,15 +106,14 @@ cd /d "%BIN%"
   "%MODEL%" ^
   --host 0.0.0.0  --port 18200 ^
   --max-context 204800  --max-concurrency 1 ^
-  --prefill-chunk 256  --default-max-tokens 16384 ^
+  --prefill-chunk 256  --default-max-tokens 65535 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
   --kvmem-sink-tokens 0 --kvmem-recent-tokens 64 --kvmem-sessions 1 ^
   --kvmem-action-lrfu --kvmem-lrfu-lambda 0.50 --kvmem-lrfu-top-frac 0.90 ^
   --kvmem-score-agg max ^
   --kv-dtype int8  --device 0  --device-profile off ^
   --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --ngram-min-match 12 --adaptive-mtp ^
-  --vision --vision-residency cpu --vision-max-merged 1024 ^
-  --default-thinking-budget 8192
+  --vision --vision-residency cpu --vision-max-merged 1024
 
 set "RC=%ERRORLEVEL%"
 echo.
