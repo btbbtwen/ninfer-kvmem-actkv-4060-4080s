@@ -112,35 +112,66 @@ GPU UUID `GPU-dba26dd9-…`、端口 18200、`-Budget 36864 -Reserve 16384 -Host
 ninfer 侧与 llama 侧的差异（`docs/multi-backend-differences.md`）：page/block **固定 64 token**；
 **没有 `--kvmem-method`**；KV 类型名是 `int8/bf16/fp8/nvfp4/k8v4/rk8v4/...` 而不是 `q8_0`；冷盘快照禁用。
 
-## 7. 当前状态（2026-10-10）
+## 7. 启动测试结果（2026-10-10）
 
 | 项目 | 状态 |
 |---|---|
-| 编译 | ✅ 完成。`ninfer-serve.exe` **512.5 MB**，sm_120a / CUDA 13.4 / VS 2022 14.44，构建脚本 exit 0 |
-| ActKV 是否进二进制 | ✅ `--help` 列出四个参数；`--kvmem-lrfu-lambda 1.5` 与 `--kvmem-score-agg bogus` 都被新加的范围校验拒绝 |
+| 编译 | ✅ `ninfer-serve.exe` **512.5 MB**，sm_120a / CUDA 13.4 / VS 2022 14.44，构建脚本 exit 0 |
+| ActKV 是否进二进制 | ✅ `--help` 列出四个参数；非法值（`lrfu-lambda 1.5`、`score-agg bogus`）被范围校验拒绝 |
 | staging | ✅ `workers/ninfer/infer-kvmem-server.exe` + FFmpeg/curl DLL + `cublas64_13.dll` / `cublasLt64_13.dll`（cublas 需从 `CUDA\v13.4\bin\x64\` 取，`bin\` 下没有） |
-| 独立可运行 | ✅ `workers\ninfer\infer-kvmem-server.exe --help` 正常 |
-| **实际加载模型 / 起服务** | ❌ **未做**。本机只有一张 RTX 5060 Ti（16 GB），启动时被另一个进程占满，见下 |
+| **通过 bat 启动** | ✅ 模型加载 11.3 GiB / 5.3 s，CUDA graphs ready，`listening on http://0.0.0.0:18200` |
+| ActKV 参数是否到达引擎 | ✅ `/v1/models` 的 `status.args` 回显了 `--kvmem-action-lrfu --kvmem-lrfu-lambda 0.50 --kvmem-lrfu-top-frac 0.90 --kvmem-score-agg max` |
+| **KVMem 长上下文检索** | ✅ 见下 |
 
-### 启动前的资源检查
+### 发现并修掉的一个真 bug：`--kvmem-score-agg max` 被误拒
 
-编译验证时本机的占用情况：
+第一次启动直接 `Server exited with code 1`，日志第一行：
 
 ```
-nvidia-smi memory.used = 15891 MiB / 16311 MiB     # 只剩约 420 MiB
-18200 端口被 PID 27316 占用
-  I:\llama\kvmem-llama.cpp-0.17.0\build-cuda13.4-dll\bin\llama-kvmem-server.exe
+ninfer-serve: --kvmem-score-agg must be mean or max
 ```
 
-ninfer 要加载 11.5 GB 的 `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer`，**必须先停掉那个进程**（它没有数据损失，
-之后用 `I:\llama\kvmem-llama.cpp-0.17.0\build-cuda13.4-dll\bin\start-llama-server.bat` 可原样重启）：
+原因：ninfer 的 `require_value()` 返回 `const char*`（`src/serve/serve_options.cpp:614`），
+而移植时写成了 `const auto mode = require_value(...)`，于是 `mode != "max"` 变成**指针比较**，
+任何取值都被判为非法。ninfer 项目自己的写法是先绑定 `std::string_view`。
+
+已改为 `const std::string_view mode = require_value("--kvmem-score-agg");`，
+重新生成补丁（`patched_tree 96659b14`、`patch_sha256 eec4019c`）并重编。
+llama.cpp 侧不受影响：那里的 `eq()` 用的是 `std::strcmp`。
+
+### 功能测试（真实模型，RTX 5060 Ti）
+
+短请求：
+
+```
+POST /v1/chat/completions  reasoning_effort=none
+  回复 "NINFER ACTKV OK"，7 completion tokens，0.5 s
+```
+
+长上下文检索（把金库密码放在上下文**开头**，后面 ~470k 字符填充）：
+
+```
+prompt_tokens = 101,049        # KVMem 预算只有 36,864，超了近 3 倍
+回复           = ZX-4471-QQ    # 开头那根针被正确召回
+finish_reason  = stop, 9 completion tokens, 268.5 s
+```
+
+启动时 `capacity | KV 53,248 tokens, int8, explicit | pages 832/832 | runtime 2.50 GiB`
+= `--kvmem-budget 36864 + --kvmem-gen-reserve 16384`，与 bat 一致。
+
+### 运行状态与停止
+
+测试结束时服务仍在运行：进程 `infer-kvmem-server`（PID 因会话而异），
+显存约 15.6 GiB / 16.3 GiB，主机 RAM 约 11 GB。停止：
 
 ```powershell
-Stop-Process -Id 27316                 # 或按 PID 重新确认后停
-# 确认显存空出来后：
-I:\llama\kvmem-llama.cpp-multi-backend-framework\start-kvmem-ninfer.bat
-# 就绪判断：curl http://127.0.0.1:18200/health
+Get-Process infer-kvmem-server | Stop-Process
 ```
 
-本次按用户选择**没有启动**，所以"能不能真正加载模型并服务请求"这一点**仍未经验证**（见实现记录里的未验证项）。
+### 仍未验证
+
+* **ActKV 开/关的收益没有做 A/B**。单次长上下文针在两种设置下都可能召回到（和历史数据一致：
+  单针在预算充足时饱和），LRFU 的收益要在**多轮**会话里才显现；需要两臂各跑一遍多轮脚本。
+* `--log-level debug`（或 KVMEM 的 trace 环境变量）下逐次换页/检索日志没有采集，因此
+  "选了哪些块、换出多少" 这一层没有直接观测。
 

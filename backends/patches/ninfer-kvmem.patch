@@ -8661,7 +8661,7 @@ index 44457ed0408b4bf33d81a75656b50d832e8bfe8b..a7aac55d77cbfad1d7d2184e37bfc941
  
  // An optional `post_thinking` object: temperature (up to `max_temperature`), top_p, top_k, min_p,
 diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
-index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d609b9aa57 100644
+index 64933ec105665b52e01c83f29acd1216e043c693..6a169c59970c2640b6a429798a214c7ef6607195 100644
 --- a/src/serve/serve_options.cpp
 +++ b/src/serve/serve_options.cpp
 @@ -1,4 +1,6 @@
@@ -8789,7 +8789,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
      std::optional<std::size_t> kv_headroom_mib;
      // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
      const char* legacy_cache_flag  = nullptr;
-@@ -603,6 +649,76 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -603,6 +649,78 @@ ServeOptions parse_serve_options(int argc, char** argv) {
              options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
              kv_capacity_explicit = true;
              continue;
@@ -8836,7 +8836,9 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
 +            continue;
 +        }
 +        if (arg == "--kvmem-score-agg") {
-+            const auto mode = require_value("--kvmem-score-agg");
++            // require_value() returns const char*: bind it to a view before
++            // comparing, or != compares pointers and every value is rejected.
++            const std::string_view mode = require_value("--kvmem-score-agg");
 +            if (mode != "mean" && mode != "max") {
 +                throw std::invalid_argument("--kvmem-score-agg must be mean or max");
 +            }
@@ -8866,7 +8868,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
          }
          if (arg == "--kv-headroom-mib" || arg == "--vram-headroom-mib") {
              // --vram-headroom-mib is the Wallawalla47 fork's name for the same headroom.
-@@ -1147,7 +1263,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1147,7 +1265,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
              continue;
          }
          if (arg == "--derive-session-keys") {
@@ -8875,7 +8877,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
              options.derive_session_keys = true;
              continue;
          }
-@@ -1227,6 +1343,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1227,6 +1345,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                  require_value("--rope-scaling-original-context"));
              continue;
          }
@@ -8889,7 +8891,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
          if (arg == "--wddm-evictable-budget") {
              options.wddm_evictable_budget = true;
              continue;
-@@ -1445,6 +1568,32 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1445,6 +1570,32 @@ ServeOptions parse_serve_options(int argc, char** argv) {
          throw std::invalid_argument("--default-graft '" + options.default_graft +
                                      "' does not name a --graft");
      }
@@ -8922,7 +8924,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
      if (!kv_capacity_explicit) {
          // The hybrid cache turns every Device page no active request holds into block cache, so
          // it sizes the KV pool to free VRAM unless a capacity is given.
-@@ -1458,8 +1607,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1458,8 +1609,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
              "caching systems");
      }
      if (options.context_cache.mode == ContextCacheMode::Hybrid) {
@@ -8933,7 +8935,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
                                          " configures the default prefix cache and cannot be "
                                          "combined with --use-alt-prefix-caching");
          }
-@@ -1497,10 +1646,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1497,10 +1648,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                      " requires --use-alt-prefix-caching");
      }
      if (kv_headroom_mib.has_value()) {
@@ -8950,7 +8952,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
      }
      if (long_anchor_spacing_explicit && !options.context_cache.automatic_long_anchors) {
          throw std::invalid_argument("--long-anchor-spacing requires --auto-long-anchors");
-@@ -1565,7 +1720,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1565,7 +1722,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
          throw std::invalid_argument("--stats-port must be in [1,65535] and differ from --port");
      }
      if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
@@ -8959,7 +8961,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
          options.kv_capacity.explicit_tokens < options.max_context) {
          throw std::invalid_argument("--kv-capacity must be at least --max-context");
      }
-@@ -1606,10 +1761,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1606,10 +1763,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
          throw std::invalid_argument(
              "--cuda-graph-allowance-mib requires CUDA graphs (omit --no-cuda-graph)");
      }
@@ -8975,7 +8977,7 @@ index 64933ec105665b52e01c83f29acd1216e043c693..92da306bccde0d3952a1c095d8ec91d6
      }
      if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
          throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
-@@ -1629,6 +1785,82 @@ ServeOptions parse_serve_options(int argc, char** argv) {
+@@ -1629,6 +1787,82 @@ ServeOptions parse_serve_options(int argc, char** argv) {
      if (options.sleep_idle_seconds != 0 && !options.suspend.enabled && !options.router()) {
          throw std::invalid_argument("--sleep-idle-seconds requires --model-suspend");
      }
