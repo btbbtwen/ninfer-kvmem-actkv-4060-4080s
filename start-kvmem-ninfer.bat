@@ -4,86 +4,115 @@ setlocal EnableExtensions
 REM ====================================================================
 REM  KVMem multi-backend launcher - ninfer backend
 REM
-REM  Same ActKV flags as start-kvmem-server.bat (llama.cpp backend), which
-REM  is the point of the port: one option surface, two backends.
+REM  Same shape as start-kvmem-server.bat (llama.cpp backend): ONE command
+REM  line, every parameter written out inline. Edit a value, save, run it.
+REM  Ctrl+C stops the server.
 REM
-REM  This is a thin wrapper over scripts\windows\start-backend.ps1, which
-REM  owns the ninfer device/stage/validation rules. The ActKV flags travel
-REM  through its -WorkerArgs and are appended verbatim to the worker argv.
+REM      start-kvmem-server.bat           llama.cpp backend, ActKV ON
+REM      start-kvmem-server-noactkv.bat   same line with the ActKV flags removed
+REM      start-kvmem-ninfer.bat           THIS FILE - ninfer backend, ActKV ON
 REM
-REM  NOTE the -Command form below. Calling the script with -File and
-REM  -WorkerArgs 'a','b' binds the whole comma list as ONE string, so the
-REM  worker would receive a single bogus argument. Verified: -Command makes
-REM  each element a separate argv entry (39 args, four ActKV flags intact).
+REM  The worker is taken from workers\ninfer\ of the repository this script
+REM  sits in (where the ninfer build is staged); CUDA_VISIBLE_DEVICES pins the
+REM  card by UUID.
 REM
-REM  ninfer differences to keep in mind (docs/multi-backend-differences.md):
-REM    * page/block size is FIXED at 64 tokens (llama.cpp uses 128 by default),
-REM      so B, R, sink and recent are rounded to whole 64-token pages;
-REM    * there is no --kvmem-method switch: with a complete query ninfer always
-REM      scores by mean-K, so ActKV's LRFU is the only retention policy knob;
-REM    * KV dtype names differ: int8/bf16/fp8/nvfp4/k8v4/rk8v4/... (not q8_0);
-REM    * cold disk snapshots (--kvmem-disk-*) are disabled for ninfer.
+REM  Alternative launcher: scripts\windows\start-backend.ps1 -Backend ninfer
+REM  wraps the same worker and adds device/stage/alignment validation. This
+REM  .bat trades those checks for the plain inline form, like the llama one.
 REM
-REM  ActKV flags used below:
-REM    --kvmem-action-lrfu            action-oriented LRFU retention
-REM    --kvmem-lrfu-lambda 0.50       paper's decay
-REM    --kvmem-lrfu-top-frac 0.90     paper's top-p hit set
-REM    --kvmem-score-agg max          Alg. 3 step 8 max over a GQA group
-REM  Remove that one -WorkerArgs group for the A/B baseline; keep the rest.
+REM --------------------------------------------------------------------
+REM  ActKV retrieval block (arXiv:2609.31395) - the flags below the model
+REM  line. Ported into the shared kvmem core, so the llama.cpp and ninfer
+REM  backends take the SAME names and defaults:
+REM
+REM  (1) Action-oriented eviction  --kvmem-action-lrfu
+REM      Blocks are kept by a temporal LRFU keep score instead of a one-shot
+REM      attention score:  KS_t = lambda*KS_{t-1} + (top-p hit ? score : 0)
+REM      lambda 0.50, top-p 0.90 are the paper's tuned values.
+REM          lambda -> 0  pure recency (chases the newest query)
+REM          lambda -> 1  pure frequency (working set freezes)
+REM      The keep score is clamped at 0 and two scoring passes inside one round
+REM      no longer decay the pool twice. Remove all three flags to revert.
+REM
+REM  (2) GQA head aggregation      --kvmem-score-agg max
+REM      ActKV Alg. 3 step 8: take the MAX attention over a GQA group's query
+REM      heads instead of the folded mean probe. Better recall on multi-topic
+REM      queries; cost is g x (g = n_head / n_head_kv) on the once-per-turn
+REM      scoring pass, NOT per token. Change "max" to "mean" to revert.
+REM
+REM  (3) Confidence-driven budget  --kvmem-conf-*   [NOT ported / off]
+REM      The ActKV monitor was dead code upstream (never called, budget never
+REM      grew). The class is ported and unit-tested, but it is NOT wired into
+REM      the generation loop, so there is no --kvmem-conf-* flag here yet.
+REM
+REM  An invalid ActKV value is rejected at startup, e.g.
+REM      --kvmem-lrfu-lambda 1.5      -> "must be in (0, 1)"
+REM      --kvmem-score-agg bogus      -> "must be mean or max"
+REM --------------------------------------------------------------------
+REM  ninfer differs from the llama.cpp backend (docs/multi-backend-differences.md):
+REM    * page/block size is FIXED at 64 tokens (llama.cpp defaults to 128), so B,
+REM      R, sink and recent round down to whole 64-token pages;
+REM    * there is NO --kvmem-method: with a complete query ninfer always scores
+REM      by mean-K, so ActKV's LRFU is the only retention-policy knob here;
+REM    * KV dtype names are int8/bf16/fp8/nvfp4/k8v4/rk8v4/... - not q8_0;
+REM    * cold disk snapshots (--kvmem-disk-path / --kvmem-disk-mib) are refused.
 REM ====================================================================
 
-title KVMem server (ninfer backend) - model.ninfer + ActKV
+title KVMem server (ninfer backend) - Qwen3.8-27B-IQ3_S-mtp + ActKV
 
+REM ---- locate the staged worker --------------------------------------
 set "ROOT=%~dp0"
-set "PS=%ROOT%scripts\windows\start-backend.ps1"
-if not exist "%PS%" (
-    echo ERROR: start-backend.ps1 not found:
-    echo   %PS%
-    echo Run this .bat from the repository root.
+set "BIN=%ROOT%workers\ninfer"
+set "EXE=%BIN%\infer-kvmem-server.exe"
+if not exist "%EXE%" (
+    echo ERROR: ninfer worker not found:
+    echo   %EXE%
+    echo.
+    echo Build it first:
+    echo   git submodule update --init --depth 1
+    echo   scripts\windows\build-backends.ps1 -Backend ninfer -CudaPath "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4" -Jobs 10
+    echo   then stage build-backends\ninfer\apps\ninfer-serve.exe there as infer-kvmem-server.exe
+    echo   ^(docs\ninfer-server-build-record.md has the full recipe^)
+    echo.
     pause
     exit /b 2
 )
 
-REM ---- model: repo-root model.ninfer, else the artifact this box keeps ------
-REM Edit MODEL to your own artifact. Use English paths and filenames.
+REM ---- model: repo-root model.ninfer, else the artifact this box keeps
 set "MODEL=%ROOT%model.ninfer"
 if not exist "%MODEL%" set "MODEL=I:\llama\ninfer-server-rtx50-sm120a-ui\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer"
 if not exist "%MODEL%" (
     echo ERROR: ninfer model not found:
     echo   %MODEL%
     echo Put a .ninfer artifact in the repository root as model.ninfer,
-    echo or edit MODEL in this file.
+    echo or edit MODEL above.
     pause
     exit /b 2
 )
 
-REM ---- build output: workers\ninfer\ninfer-kvmem-server.exe -----------------
-set "WORKER=%ROOT%workers\ninfer\ninfer-kvmem-server.exe"
-if not exist "%WORKER%" (
-    echo ERROR: ninfer worker not built yet:
-    echo   %WORKER%
-    echo.
-    echo Build it with:
-    echo   git submodule update --init --depth 1
-    echo   scripts\windows\build-backends.ps1 -Backend ninfer -CudaPath "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4" -Jobs 10
-    echo   then copy the built ninfer-serve.exe to that path.
-    echo.
-    pause
-    exit /b 2
-)
+REM ---- GPU: ninfer wants UUIDs, comma separated in stage order --------
+REM An existing CUDA_VISIBLE_DEVICES wins; otherwise this box's RTX 5060 Ti.
+if defined CUDA_VISIBLE_DEVICES (set "GPU=%CUDA_VISIBLE_DEVICES%") else (set "GPU=GPU-dba26dd9-930f-1b01-2b05-22c1fca6cdce")
+set "CUDA_VISIBLE_DEVICES=%GPU%"
 
-REM ---- GPU: ninfer wants UUIDs, in stage order, comma separated -------------
-REM Defaults to CUDA_VISIBLE_DEVICES, then to this box's RTX 5060 Ti UUID.
-set "GPU=%CUDA_VISIBLE_DEVICES%"
-if not defined GPU set "GPU=GPU-dba26dd9-930f-1b01-2b05-22c1fca6cdce"
+cd /d "%BIN%"
 
-echo Starting ninfer backend at http://127.0.0.1:18200/  (Ctrl+C stops it)
-echo.
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PS%' -Backend ninfer -Model '%MODEL%' -Gpu '%GPU%' -Port 18200 -Context 204800 -Concurrency 1 -Prefill 256 -MaxTokens 16384 -Budget 36864 -Reserve 16384 -HostMiB 12288 -RetainedSessions 1 -KvType int8 -MtpDrafts 4 -AdaptiveMtp -NgramDrafts 31 -Vision -VisionResidency cpu -VisionTokens 1024 -ThinkingBudget 8192 -SinkTokens 0 -RecentTokens 64 -WorkerArgs '--kvmem-action-lrfu','--kvmem-lrfu-lambda','0.50','--kvmem-lrfu-top-frac','0.90','--kvmem-score-agg','max'"
+"%EXE%" ^
+  "%MODEL%" ^
+  --host 0.0.0.0  --port 18200 ^
+  --max-context 204800  --max-concurrency 1 ^
+  --prefill-chunk 256  --default-max-tokens 16384 ^
+  --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
+  --kvmem-sink-tokens 0 --kvmem-recent-tokens 64 --kvmem-sessions 1 ^
+  --kvmem-action-lrfu --kvmem-lrfu-lambda 0.50 --kvmem-lrfu-top-frac 0.90 ^
+  --kvmem-score-agg max ^
+  --kv-dtype int8  --device 0  --device-profile off ^
+  --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --ngram-min-match 12 --adaptive-mtp ^
+  --vision --vision-residency cpu --vision-max-merged 1024 ^
+  --default-thinking-budget 8192
 
 set "RC=%ERRORLEVEL%"
 echo.
-echo ninfer backend exited with code %RC%.
+echo Server exited with code %RC%.
 pause
 endlocal & exit /b %RC%
