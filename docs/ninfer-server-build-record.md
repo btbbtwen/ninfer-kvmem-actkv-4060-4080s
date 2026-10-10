@@ -111,3 +111,36 @@ GPU UUID `GPU-dba26dd9-…`、端口 18200、`-Budget 36864 -Reserve 16384 -Host
 
 ninfer 侧与 llama 侧的差异（`docs/multi-backend-differences.md`）：page/block **固定 64 token**；
 **没有 `--kvmem-method`**；KV 类型名是 `int8/bf16/fp8/nvfp4/k8v4/rk8v4/...` 而不是 `q8_0`；冷盘快照禁用。
+
+## 7. 当前状态（2026-10-10）
+
+| 项目 | 状态 |
+|---|---|
+| 编译 | ✅ 完成。`ninfer-serve.exe` **512.5 MB**，sm_120a / CUDA 13.4 / VS 2022 14.44，构建脚本 exit 0 |
+| ActKV 是否进二进制 | ✅ `--help` 列出四个参数；`--kvmem-lrfu-lambda 1.5` 与 `--kvmem-score-agg bogus` 都被新加的范围校验拒绝 |
+| staging | ✅ `workers/ninfer/infer-kvmem-server.exe` + FFmpeg/curl DLL + `cublas64_13.dll` / `cublasLt64_13.dll`（cublas 需从 `CUDA\v13.4\bin\x64\` 取，`bin\` 下没有） |
+| 独立可运行 | ✅ `workers\ninfer\infer-kvmem-server.exe --help` 正常 |
+| **实际加载模型 / 起服务** | ❌ **未做**。本机只有一张 RTX 5060 Ti（16 GB），启动时被另一个进程占满，见下 |
+
+### 启动前的资源检查
+
+编译验证时本机的占用情况：
+
+```
+nvidia-smi memory.used = 15891 MiB / 16311 MiB     # 只剩约 420 MiB
+18200 端口被 PID 27316 占用
+  I:\llama\kvmem-llama.cpp-0.17.0\build-cuda13.4-dll\bin\llama-kvmem-server.exe
+```
+
+ninfer 要加载 11.5 GB 的 `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer`，**必须先停掉那个进程**（它没有数据损失，
+之后用 `I:\llama\kvmem-llama.cpp-0.17.0\build-cuda13.4-dll\bin\start-llama-server.bat` 可原样重启）：
+
+```powershell
+Stop-Process -Id 27316                 # 或按 PID 重新确认后停
+# 确认显存空出来后：
+I:\llama\kvmem-llama.cpp-multi-backend-framework\start-kvmem-ninfer.bat
+# 就绪判断：curl http://127.0.0.1:18200/health
+```
+
+本次按用户选择**没有启动**，所以"能不能真正加载模型并服务请求"这一点**仍未经验证**（见实现记录里的未验证项）。
+
