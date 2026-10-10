@@ -5324,16 +5324,17 @@ index 9085edcc7beaa3649711d7695784d2494dea7755..5e011c51e9c8589b8f5474932ac83868
      sequence.dflash_context_frontier = 0;
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..f3b9c264e999db8bb3b00bb97d642e8923b49714
+index 0000000000000000000000000000000000000000..139b4922103d246b6bad70de8e60b09ce68a1e45
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-@@ -0,0 +1,977 @@
+@@ -0,0 +1,988 @@
 +#include "models/qwen3_5/program/program_impl.h"
 +#include "models/qwen3_5/program/context.h"
 +#include "models/qwen3_5/program/context_work.h"
 +
 +#include <atomic>
 +#include <cstdio>
++#include <cstdlib>
 +#include <cstring>
 +
 +namespace ninfer::models::qwen3_5::detail {
@@ -5789,6 +5790,16 @@ index 0000000000000000000000000000000000000000..f3b9c264e999db8bb3b00bb97d642e89
 +             kvmem_window_tokens, kvmem_options.host_bytes});
 +        while (session.advance() != kvmem::MemoryPhase::Ready) {}
 +        session.publish();
++        if (std::getenv("KVMEM_WINDOW_TRACE")) {
++            const auto compact = compact_position(sequence, end);
++            std::fprintf(stderr,
++                "KVMEM_WINDOW_TRACE reselect logical=%u compact=%u window=%u selected=%zu "
++                "mandatory=%zu force=%d query_complete=%d removed_after=%u\n",
++                end, compact, kvmem_window_tokens, selected.size(), mandatory.size(),
++                force_selection ? 1 : 0,
++                (sequence.window.query_tokens != 0) ? 1 : 0,
++                sequence.window.removed_tokens);
++        }
 +    }
 +    ensure_sequence_kv_mapped(sequence, end, backend_kv_pages ? end : 0);
 +    const auto mapped = kv_pages_for_tokens(compact_position(sequence, end));
