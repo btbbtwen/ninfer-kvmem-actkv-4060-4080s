@@ -5324,15 +5324,16 @@ index 9085edcc7beaa3649711d7695784d2494dea7755..5e011c51e9c8589b8f5474932ac83868
      sequence.dflash_context_frontier = 0;
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..139b4922103d246b6bad70de8e60b09ce68a1e45
+index 0000000000000000000000000000000000000000..c4f24ce5db4ad15070ec25535604ec5756394e12
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-@@ -0,0 +1,988 @@
+@@ -0,0 +1,1031 @@
 +#include "models/qwen3_5/program/program_impl.h"
 +#include "models/qwen3_5/program/context.h"
 +#include "models/qwen3_5/program/context_work.h"
 +
 +#include <atomic>
++#include <chrono>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
@@ -5731,9 +5732,19 @@ index 0000000000000000000000000000000000000000..139b4922103d246b6bad70de8e60b09c
 +    }
 +    if (end == begin && !force_selection) { return; }
 +    if (force_selection || compact_position(sequence, end) > kvmem_window_tokens) {
++        // Diagnostic split for the reselect path. The engine reports one
++        // "submit" figure for the whole call, which cannot say whether a slow
++        // prefill chunk is KVMem scoring/scoping or the session transaction.
++        using ProbeClock = std::chrono::steady_clock;
++        const auto probe_ms = [](ProbeClock::time_point a, ProbeClock::time_point b) {
++            return static_cast<double>(
++                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count()) * 1.0e-6;
++        };
++        const auto probe_start = ProbeClock::now();
 +        auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
 +        kvmem::MemorySession session(backend);
 +        const auto count = kv_pages_for_tokens(begin);
++        const auto probe_session_built = ProbeClock::now();
 +        const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
 +        auto& state = sequence.window;
 +        std::vector<std::uint64_t> mandatory;
@@ -5768,6 +5779,13 @@ index 0000000000000000000000000000000000000000..139b4922103d246b6bad70de8e60b09c
 +            const std::vector<std::uint32_t> required(mandatory.begin(), mandatory.end());
 +            const auto ids = state.selector->pick_topk_blocks(required);
 +            selected.assign(ids.begin(), ids.end());
++            // ActKV two-phase commit: the round's keep score is applied now that
++            // the selection exists, so only blocks this round actually kept can
++            // grow. A no-op unless action_lrfu and deferred_lrfu are both on.
++            {
++                std::vector<std::uint32_t> kept(ids.begin(), ids.end());
++                state.selector->commit_lrfu(kept);
++            }
 +            if (kvmem_options.verify_transfers) {
 +                std::size_t cold = 0;
 +                for (auto id : ids) {
@@ -5784,12 +5802,26 @@ index 0000000000000000000000000000000000000000..139b4922103d246b6bad70de8e60b09c
 +                if (std::find(selected.begin(), selected.end(), id) == selected.end()) selected.push_back(id);
 +            }
 +            std::sort(selected.begin(), selected.end());
++            // No scoring happened this round, so nothing may be pending; commit
++            // with the recency selection anyway so a held round cannot leak into
++            // the next one. Cheap and a no-op in the normal case. `selected` is
++            // the 64-bit plan id type, so narrow it for the selector's API.
++            {
++                std::vector<std::uint32_t> kept;
++                kept.reserve(selected.size());
++                for (const auto id : selected) kept.push_back(static_cast<std::uint32_t>(id));
++                state.selector->commit_lrfu(kept);
++            }
 +        }
++        const auto probe_selected = ProbeClock::now();
 +        session.prepare(backend->stamp(), selected, mandatory,
 +            {kvmem_options.selected_tokens, kvmem_options.reserve_tokens,
 +             kvmem_window_tokens, kvmem_options.host_bytes});
++        const auto probe_prepared = ProbeClock::now();
 +        while (session.advance() != kvmem::MemoryPhase::Ready) {}
++        const auto probe_advanced = ProbeClock::now();
 +        session.publish();
++        const auto probe_published = ProbeClock::now();
 +        if (std::getenv("KVMEM_WINDOW_TRACE")) {
 +            const auto compact = compact_position(sequence, end);
 +            std::fprintf(stderr,
@@ -5799,6 +5831,17 @@ index 0000000000000000000000000000000000000000..139b4922103d246b6bad70de8e60b09c
 +                force_selection ? 1 : 0,
 +                (sequence.window.query_tokens != 0) ? 1 : 0,
 +                sequence.window.removed_tokens);
++        }
++        if (std::getenv("KVMEM_WINDOW_PROBE")) {
++            std::fprintf(stderr,
++                "KVMEM_WINDOW_PROBE logical=%u ctor=%.1fms select=%.1fms prepare=%.1fms "
++                "advance=%.1fms publish=%.1fms total=%.1fms selected=%zu\n",
++                end, probe_ms(probe_start, probe_session_built),
++                probe_ms(probe_session_built, probe_selected),
++                probe_ms(probe_selected, probe_prepared),
++                probe_ms(probe_prepared, probe_advanced),
++                probe_ms(probe_advanced, probe_published),
++                probe_ms(probe_start, probe_published), selected.size());
 +        }
 +    }
 +    ensure_sequence_kv_mapped(sequence, end, backend_kv_pages ? end : 0);
@@ -6318,10 +6361,10 @@ index 0000000000000000000000000000000000000000..139b4922103d246b6bad70de8e60b09c
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/memory_snapshot.cpp b/src/models/qwen3_5/program/storage/memory_snapshot.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8adad98459ef1ce27d86754434b0930e373c7671
+index 0000000000000000000000000000000000000000..c40f0bf13b528f31ab6c87dc29596a577a9be886
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/memory_snapshot.cpp
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,357 @@
 +#include "models/qwen3_5/program/program_impl.h"
 +#include "kvmem/snapshot.hpp"
 +#include <bit>
@@ -6643,6 +6686,8 @@ index 0000000000000000000000000000000000000000..8adad98459ef1ce27d86754434b0930e
 +        selection.action_lrfu = kvmem_options.action_lrfu;
 +        selection.lrfu_lambda = kvmem_options.lrfu_lambda;
 +        selection.lrfu_top_frac = kvmem_options.lrfu_top_frac;
++        // Same two-phase policy as a freshly built selector; see memory_statistics.
++        selection.deferred_lrfu = true;
 +        window.selector = std::make_unique<kvmem::KvMemStore>(selection);
 +        window.selector->register_append(frontier);
 +        window.statistics_frontier = frontier; window.host_bytes = required;
@@ -6679,10 +6724,10 @@ index 0000000000000000000000000000000000000000..8adad98459ef1ce27d86754434b0930e
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/memory_statistics.cpp b/src/models/qwen3_5/program/storage/memory_statistics.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..36a43d2f86193e38d949a732777bb03a28c760b9
+index 0000000000000000000000000000000000000000..332377b8d99252c70fdff353eee64a924437b368
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/memory_statistics.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,155 @@
 +#include "models/qwen3_5/program/program_impl.h"
 +#include <cmath>
 +#include <cstdio>
@@ -6730,6 +6775,11 @@ index 0000000000000000000000000000000000000000..36a43d2f86193e38d949a732777bb03a
 +        selection.action_lrfu = kvmem_options.action_lrfu;
 +        selection.lrfu_lambda = kvmem_options.lrfu_lambda;
 +        selection.lrfu_top_frac = kvmem_options.lrfu_top_frac;
++        // This backend scores first and selects afterwards (prepare_window does
++        // set_retrieval_scores, then pick_topk_blocks), so the keep score must be
++        // committed once the selection exists -- otherwise a block grows on a
++        // score it never won a slot for. commit_lrfu() applies the held round.
++        selection.deferred_lrfu = true;
 +        state.selector = std::make_unique<kvmem::KvMemStore>(selection);
 +        state.query_sum.assign(memory_statistics->query_elements(), 0.0F);
 +        state.query_begin = query_begin;
@@ -8569,6 +8619,47 @@ index 3ba42f01dc15452752c2cef8953e64d9874e5e7a..444aec61475734a925a00a2f653d3bb8
                                                                    "tools",
                                                                    "truncation"};
      const auto& allowed = create ? create_fields : count_fields;
+diff --git a/src/serve/operational_log.cpp b/src/serve/operational_log.cpp
+index e763a68535b56851299e985c53f04351436b2225..c74fa5996849059c86909357e8c977620b4aa598 100644
+--- a/src/serve/operational_log.cpp
++++ b/src/serve/operational_log.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstdlib>
+ #include <iomanip>
+ #include <sstream>
+ #include <string>
+@@ -436,6 +437,28 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
+         report.interval_seconds > 0.0 ? host_seconds / report.interval_seconds : 0.0;
+     out << " | host " << product::format_pretty_percent(host_ratio) << " ("
+         << product::format_pretty_duration(host_seconds) << ')';
++    // Breakdown of the host figure above. Without it the single percentage says
++    // only that the CPU was busy; these five counters say where, which is what
++    // decides whether the cost is engine bookkeeping or KVMem staging.
++    if (std::getenv("NINFER_HOST_BREAKDOWN")) {
++        const auto& current = report.current.host_work;
++        const auto& previous = report.previous.host_work;
++        const auto ms = [](std::uint64_t ns) {
++            return static_cast<double>(ns) * 1.0e-6;
++        };
++        out << " | host_parts boundary=" << std::fixed << std::setprecision(0)
++            << ms(monotonic_delta(previous.engine_boundary_ns, current.engine_boundary_ns))
++            << "ms submit="
++            << ms(monotonic_delta(previous.program_submit_ns, current.program_submit_ns))
++            << "ms post="
++            << ms(monotonic_delta(previous.program_post_ns, current.program_post_ns))
++            << "ms commit="
++            << ms(monotonic_delta(previous.engine_commit_output_ns, current.engine_commit_output_ns))
++            << "ms maint="
++            << ms(monotonic_delta(previous.engine_maintenance_ns, current.engine_maintenance_ns))
++            << "ms devicewait=" << ms(monotonic_delta(previous.device_wait_ns, current.device_wait_ns))
++            << "ms";
++    }
+     return {.severity = OperationalSeverity::Info, .message = out.str()};
+ }
+ 
 diff --git a/src/serve/request.h b/src/serve/request.h
 index 89246fedeb2c88e954a0c94baddb4d2eae9f8611..76e77b7d7d0c5db7cdf2414cdbb34c3aa9fc6116 100644
 --- a/src/serve/request.h
