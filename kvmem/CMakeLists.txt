@@ -16,6 +16,8 @@ add_library(kvmem
     src/host/memory_contract.cpp
     src/host/kv_content.cpp
     src/host/native_kv_payload.cpp
+    src/host/host_kv_storage.cpp
+    src/host/spill_io.cpp
     src/host/session_memory.cpp
     src/host/confidence_monitor.cpp
     src/host/rope.cpp
