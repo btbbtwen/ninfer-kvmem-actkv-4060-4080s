@@ -154,14 +154,13 @@ cd /d "%BIN%"
 
 "%EXE%" ^
   "%MODEL%" ^
-  --host 127.0.0.1  --port 18200 ^
-  --max-context 262144 --kvmem-sessions 1 --kvmem-recent-tokens 1024 ^
-  --prefill-chunk 256  --default-max-tokens 65535 ^
+  --port 18200 ^
+  --max-context 262144 --kvmem-recent-tokens 1024 ^
+  --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 --device-profile off ^
-  --kvmem-action-lrfu --kvmem-lrfu-lambda 0.50 --kvmem-lrfu-top-frac 0.90 --kvmem-score-agg mean ^
-  --model-id ninfer-27b ^
-  --kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
-  --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --ngram-min-match 12 --adaptive-mtp ^
+  --kvmem-action-lrfu --model-id ninfer-27b ^
+  --kv-dtype int8 --temperature 1.0 --top-p 0.95 ^
+  --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
   --vision --vision-residency cpu --vision-max-merged 1024 ^
   --default-reasoning-effort medium --default-thinking-budget 16384
  
