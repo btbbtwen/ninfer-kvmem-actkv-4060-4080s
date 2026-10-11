@@ -264,6 +264,10 @@ struct KvMemStoreConfig {
     bool   action_lrfu   = false;    // --kvmem-action-lrfu
     float  lrfu_lambda   = 0.50f;    // --kvmem-lrfu-lambda
     float  lrfu_top_frac = 0.90f;    // --kvmem-lrfu-top-frac
+    // Restrict growth to the blocks the round actually kept (two-phase form).
+    // Callers that select after scoring set this and call commit_lrfu; callers
+    // that cannot report a selection leave it off and keep the score-only rule.
+    bool   deferred_lrfu = false;    // --kvmem-lrfu-deferred
 
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
@@ -477,6 +481,19 @@ public:
     void set_retrieval_scores(const std::vector<double> &scores,
                               uint64_t round_id = 0);
 
+    // Two-phase ActKV for callers that select AFTER scoring (the ninfer
+    // backend does: score, pick_topk_blocks, then stage). set_retrieval_scores
+    // with action_lrfu on would fold the score into KS immediately, before the
+    // selection exists, so a block could grow on a score it never won a slot
+    // for. With KvMemStoreConfig::deferred_lrfu the store instead holds the
+    // round's scores and waits for commit_lrfu, which applies the update using
+    // the caller's actual selection as the hit set (Alg. 1 over the action
+    // region).
+    //
+    // Apply the deferred round: `selected` is the block set this round kept.
+    // No-op unless action_lrfu && deferred_lrfu and a round is pending.
+    void commit_lrfu(const std::vector<uint32_t> & selected);
+
     // ActKV Alg. 1 steps 3-4, applied directly. `scores` is the per-block
     // action-region retrieval score for this ORA round, indexed by block_id.
     //   KS[hit ] <- lambda * KS[hit ] + score[hit ]
@@ -485,7 +502,16 @@ public:
     // mass, so a negative keep score would permanently sink a block).
     // A zero `round_id` derives the round from the block frontier; see
     // set_retrieval_scores.
-    void accumulate_lrfu(const std::vector<double> &scores, uint64_t round_id = 0);
+    //
+    // `selected` is optional and narrows what counts as a hit: when it is
+    // non-null, only a block that is BOTH selected this round and carrying a
+    // positive score may grow. That is the paper's action region -- the entries
+    // the model actually kept -- and it stops a block from building a keep score
+    // out of a weak score it never won a slot for. A caller that does not know
+    // its selection yet passes nullptr and keeps the score-only rule.
+    // `selected` may be any order and may contain ids >= block_count().
+    void accumulate_lrfu(const std::vector<double> &scores, uint64_t round_id = 0,
+                         const std::vector<uint32_t> * selected = nullptr);
 
     // Drop every keep score (new session, prefix rewrite). Without this a
     // shrunk-then-regrown block keeps stale heat forever.
@@ -547,6 +573,10 @@ private:
     // Scratch for the top-p threshold selection. Reused so the per-round LRFU
     // update does not heap-allocate: a caller may score once per prefill chunk.
     std::vector<double> lrfu_scratch_;
+    // Round held between set_retrieval_scores and commit_lrfu in deferred mode.
+    std::vector<double> lrfu_pending_scores_;
+    uint64_t lrfu_pending_round_ = 0;
+    bool     lrfu_pending_ = false;
 };
 
 } // namespace kvmem

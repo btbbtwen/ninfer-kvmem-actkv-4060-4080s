@@ -240,8 +240,46 @@ void KvMemStore::set_attn_scores(const std::vector<double> &scores) {
     set_retrieval_scores(scores);
 }
 
+// Top-p hit rule for the ActKV keep score, shared by the immediate and the
+// deferred paths so both agree on what counts as a hit.
+//
+// The threshold is taken over the scores that carry positive evidence. KVMem
+// re-scores every resident block every round, so it is NOT the paper's small
+// action region: a threshold over the whole pool would mark roughly p of the
+// pool a hit even in a round where the query matches nothing. KS would then grow
+// with page AGE instead of relevance, and pick_topk would start preferring the
+// oldest blocks -- exactly the ones whose host records the tier has dropped.
+// Requiring scores[i] > 0 keeps "hit" meaning "the model cared this round".
+struct LrfuHitMask {
+    double threshold = 0.0;
+    bool   thresholded = false;
+};
+
+LrfuHitMask lrfu_hit_mask(std::vector<double> & scratch,
+                          const std::vector<double> & scores,
+                          uint32_t n_score, double p) {
+    LrfuHitMask out;
+    scratch.clear();
+    for (uint32_t i = 0; i < n_score; ++i) {
+        if (scores[i] > 0.0) scratch.push_back(scores[i]);
+    }
+    const size_t n_pos = scratch.size();
+    out.thresholded = p < 1.0 && n_pos > 1;
+    if (n_pos > 0) {
+        const double want = (1.0 - p) * static_cast<double>(n_pos);
+        size_t rank = static_cast<size_t>(want);
+        if (rank >= n_pos) rank = n_pos - 1;   // guard: p -> 0
+        // The input is const, so the threshold needs a copy; reuse the caller's
+        // buffer instead of allocating one per call.
+        std::nth_element(scratch.begin(), scratch.begin() + rank, scratch.end());
+        out.threshold = out.thresholded ? scratch[rank] : 0.0;
+    }
+    return out;
+}
+
 void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
-                                 uint64_t round_id) {
+                                 uint64_t round_id,
+                                 const std::vector<uint32_t> * selected) {
     const uint32_t n = block_count();
     if (n == 0) return;
 
@@ -267,43 +305,28 @@ void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
 
     const uint32_t n_score = std::min<uint32_t>(
         static_cast<uint32_t>(scores.size()), n);
-    // Top-p hit mask (paper: p = 90%), taken over the scores that carry positive
-    // evidence.
-    //
-    // KVMem re-scores every resident block in every round, so it is NOT the
-    // paper's small action region: a threshold over the whole pool marks roughly
-    // p of the pool a hit even in a round where the query matches nothing. KS
-    // would then grow with page AGE instead of relevance, and pick_topk would
-    // start preferring the oldest blocks -- exactly the ones whose host records
-    // the tier has already dropped. Staging one of those in is what corrupts the
-    // window at large context. Requiring scores[i] > 0 and ranking the threshold
-    // among the positive scores keeps "hit" meaning "the model cared this round".
-    // A round with no positive score is a pure decay.
     const double p = (cfg_.lrfu_top_frac > 0.0f && cfg_.lrfu_top_frac < 1.0f)
         ? static_cast<double>(cfg_.lrfu_top_frac) : 1.0;
-    lrfu_scratch_.clear();
-    for (uint32_t i = 0; i < n_score; ++i) {
-        if (scores[i] > 0.0) lrfu_scratch_.push_back(scores[i]);
-    }
-    const size_t n_pos = lrfu_scratch_.size();
-    const bool thresholded = p < 1.0 && n_pos > 1;
-    double threshold = 0.0;
-    if (n_pos > 0) {
-        const double want = (1.0 - p) * static_cast<double>(n_pos);
-        size_t rank = static_cast<size_t>(want);
-        if (rank >= n_pos) rank = n_pos - 1;   // guard: p -> 0
-        // The input is const, so the threshold needs a copy; reuse the member
-        // buffer instead of allocating one per call.
-        std::nth_element(lrfu_scratch_.begin(), lrfu_scratch_.begin() + rank,
-                         lrfu_scratch_.end());
-        threshold = thresholded ? lrfu_scratch_[rank] : 0.0;
-    }
+    const LrfuHitMask mask = lrfu_hit_mask(lrfu_scratch_, scores, n_score, p);
+    const bool thresholded = mask.thresholded;
+    const double threshold = mask.threshold;
 
     const double lambda = static_cast<double>(cfg_.lrfu_lambda);
+    // When the caller knows which blocks this round kept, only those may grow.
+    // Membership is tested through a byte map so the check stays O(1) per block
+    // and tolerates an unsorted or out-of-range id list.
+    std::vector<uint8_t> in_selection;
+    if (selected != nullptr) {
+        in_selection.assign(n, 0);
+        for (uint32_t id : *selected) {
+            if (id < n) in_selection[id] = 1;
+        }
+    }
     for (uint32_t i = 0; i < n; ++i) {
         double ks = lambda * blocks_[i].lrfu_score;
-        if (i < n_score && scores[i] > 0.0 &&
-            (!thresholded || scores[i] >= threshold)) {
+        const bool carried = i < n_score && scores[i] > 0.0 &&
+            (!thresholded || scores[i] >= threshold);
+        if (carried && (selected == nullptr || in_selection[i])) {
             ks += scores[i];
         }
         // AttnScore is a non-negative attention mass. Clamping at 0 keeps a
@@ -333,6 +356,42 @@ void KvMemStore::set_retrieval_scores(const std::vector<double> &scores,
         for (uint32_t i = 0; i < n; ++i) {
             blocks_[i].retrieval_score = (i < scores.size()) ? scores[i] : 0.0;
         }
+        if (cfg_.deferred_lrfu) {
+            // Two-phase form. commit_lrfu() knows the selection, so the real KS
+            // update waits for it -- but the ranking has to happen NOW, inside
+            // pick_topk_blocks, so attn_score cannot simply stay at the previous
+            // KS. Doing that hid the current query from the selector entirely:
+            // on the first round every attn_score was zero (so selection fell
+            // back to recency and looked fine), and after that the accumulated KS
+            // of old blocks locked the window shut. A block written this round
+            // has KS = 0, could never outrank the incumbents, and was evicted
+            // again immediately -- the just-written needle became unreadable.
+            //
+            // So publish a PROVISIONAL KS here: lambda * KS + this round's hit.
+            // It has exactly the ranking the immediate path would use, while
+            // lrfu_score itself is left untouched until commit_lrfu applies the
+            // narrower, selection-gated update.
+            lrfu_pending_scores_.assign(scores.begin(), scores.end());
+            lrfu_pending_round_ = round_id;
+            lrfu_pending_ = true;
+            const uint32_t n = block_count();
+            const uint32_t n_score = std::min<uint32_t>(
+                static_cast<uint32_t>(scores.size()), n);
+            const double p = (cfg_.lrfu_top_frac > 0.0f && cfg_.lrfu_top_frac < 1.0f)
+                ? static_cast<double>(cfg_.lrfu_top_frac) : 1.0;
+            const LrfuHitMask mask = lrfu_hit_mask(lrfu_scratch_, scores, n_score, p);
+            const double lambda = static_cast<double>(cfg_.lrfu_lambda);
+            for (uint32_t i = 0; i < n; ++i) {
+                double ks = lambda * blocks_[i].lrfu_score;
+                if (i < n_score && scores[i] > 0.0 &&
+                    (!mask.thresholded || scores[i] >= mask.threshold)) {
+                    ks += scores[i];
+                }
+                if (ks < 0.0) ks = 0.0;
+                blocks_[i].attn_score = ks;
+            }
+            return;
+        }
         accumulate_lrfu(scores, round_id);
         return;
     }
@@ -340,6 +399,17 @@ void KvMemStore::set_retrieval_scores(const std::vector<double> &scores,
         blocks_[i].retrieval_score = (i < scores.size()) ? scores[i] : 0.0;
         blocks_[i].attn_score = blocks_[i].retrieval_score;
     }
+}
+
+void KvMemStore::commit_lrfu(const std::vector<uint32_t> & selected) {
+    if (!cfg_.action_lrfu || !cfg_.deferred_lrfu || !lrfu_pending_) return;
+    // Apply the held round with the caller's selection as the hit set, then drop
+    // it. accumulate_lrfu keeps its own idempotency guard, so a second commit
+    // for the same round stays a no-op.
+    accumulate_lrfu(lrfu_pending_scores_, lrfu_pending_round_, &selected);
+    lrfu_pending_ = false;
+    lrfu_pending_scores_.clear();
+    lrfu_pending_round_ = 0;
 }
 
 void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
