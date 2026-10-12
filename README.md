@@ -1,3 +1,21 @@
+启动参数
+  --port 18200 ^
+  --max-context 262144 --kvmem-recent-tokens 1024 ^
+  --prefill-chunk 256 ^
+  --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
+  --kvmem-action-lrfu --model-id ninfer-27b ^
+  --kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
+  --vision --vision-residency cpu --vision-max-merged 256 ^
+  --default-reasoning-effort medium  --default-thinking-budget 16384
+  
+---
+
+  --kvmem-action-lrfu 为开启actkv
+  --vision --vision-residency cpu --vision-max-merged 256 cpu运算需使用256，gpu可改为1024
+  
+---
+  
 # 262144 上下文 KVMem + ActKV 召回与速度实测报告
 
 **测试日期**：2026-10-11
