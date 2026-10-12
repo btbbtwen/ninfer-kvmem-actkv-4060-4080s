@@ -11,9 +11,13 @@
   
 ---
 
-  --kvmem-action-lrfu 为开启actkv
-  --vision --vision-residency cpu --vision-max-merged 256 cpu运算需使用256，gpu可改为1024
+  --kvmem-action-lrfu 为开启actkv  
+
+  --vision --vision-residency cpu 
+
+  --vision-max-merged 256 cpu运算需使用256，gpu可改为1024
   
+
 ---
   
 # 262144 上下文 KVMem + ActKV 召回与速度实测报告
